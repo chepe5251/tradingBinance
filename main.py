@@ -11,6 +11,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -21,6 +22,10 @@ from data_stream import MarketDataStream
 from strategy import evaluate_signal
 from risk import RiskManager
 from execution import FuturesExecutor
+
+_TELEGRAM_SEND_LOCK = threading.Lock()
+_TELEGRAM_LAST_SEND_TS = 0.0
+_TELEGRAM_MIN_INTERVAL_SEC = 1.2
 
 
 def _configure_client(api_key: str, api_secret: str, testnet: bool) -> Client:
@@ -229,21 +234,42 @@ def _send_telegram_message(token: str, chat_id: str, message: str) -> None:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = urlencode({"chat_id": chat_id, "text": message})
-    req = Request(
-        url,
-        data=payload.encode("utf-8"),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
     last_exc: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 6):
         try:
-            with urlopen(req, timeout=10):
-                return
+            with _TELEGRAM_SEND_LOCK:
+                global _TELEGRAM_LAST_SEND_TS
+                now = time.time()
+                wait_sec = _TELEGRAM_MIN_INTERVAL_SEC - (now - _TELEGRAM_LAST_SEND_TS)
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
+                req = Request(
+                    url,
+                    data=payload.encode("utf-8"),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with urlopen(req, timeout=10):
+                    _TELEGRAM_LAST_SEND_TS = time.time()
+                    return
+        except HTTPError as exc:
+            last_exc = exc
+            if exc.code == 429:
+                retry_after = 5.0
+                try:
+                    header_val = exc.headers.get("Retry-After")
+                    if header_val:
+                        retry_after = max(1.0, float(header_val))
+                except Exception:
+                    retry_after = 5.0
+                time.sleep(retry_after)
+                continue
+            if attempt < 5:
+                time.sleep(min(float(attempt), 5.0))
         except Exception as exc:
             last_exc = exc
-            if attempt < 3:
-                time.sleep(float(attempt))
+            if attempt < 5:
+                time.sleep(min(float(attempt), 5.0))
     if last_exc is not None:
         raise last_exc
 
