@@ -1,72 +1,72 @@
 # Binance Futures Scalping Bot (USDT-M)
 
-Bot algorítmico para **Binance Futures USDT-M** con:
-- escaneo multi-par (hasta 200 símbolos),
-- generación de señales en Telegram,
-- ejecución automática de 1 operación activa a la vez,
-- protección TP/SL y monitoreo continuo.
+Algorithmic trading bot for **Binance USDT-M Futures** with:
+- multi-pair scanning (up to 200 symbols),
+- Telegram signal broadcasting,
+- automatic execution with only 1 active trade at a time,
+- TP/SL protection and continuous monitoring.
 
-## Aviso importante
-Este software puede abrir/cerrar operaciones reales. Úsalo bajo tu propio riesgo, idealmente primero en **testnet** o **paper mode**.
+## Important Notice
+This software can open and close real positions. Use it at your own risk. Start in **testnet** or **paper mode** first.
 
-## Características principales
-- Escaneo de universo USDT perpetual.
-- Estrategia de señal en `M15` con sesgo estricto `1H`.
-- Envío de **todas** las señales válidas a Telegram.
-- Ejecución de solo la primera señal cuando:
-  - `RiskManager` permite operar, y
-  - no hay posición abierta.
-- Entrada limit con fallback a market.
-- TP/SL obligatorios con reposición automática si se pierden.
-- Escalado por pérdida flotante (niveles configurados en lógica actual).
-- Heartbeat y auto-restart del stream WebSocket.
+## Core Features
+- USDT perpetual symbol universe scanning.
+- Signal strategy on `M15` with strict `1H` bias alignment.
+- Sends **all** valid signals to Telegram.
+- Executes only the first valid signal when:
+  - `RiskManager` allows trading, and
+  - no open position exists.
+- Limit entry with market fallback.
+- Mandatory TP/SL with automatic recovery if protection orders are lost.
+- Floating-loss scaling (levels defined in current logic).
+- WebSocket heartbeat and automatic restart.
 
-## Arquitectura
-- `main.py`: orquestación general (stream, señales, ejecución, monitoreo).
-- `strategy.py`: motor de señales.
-- `execution.py`: ejecución, redondeo por filtros Binance, TP/SL, monitor OCO.
-- `data_stream.py`: carga histórica + WebSocket + caché de velas.
-- `risk.py`: cooldown, drawdown diario, pausa por pérdidas.
-- `config.py`: modelo `Settings` y carga desde `.env`.
-- `indicators.py`: utilidades de indicadores (si se usan en flujos auxiliares).
-- `test_trade.py`: script manual para validar envío de orden mínima.
+## Architecture
+- `main.py`: orchestration (stream, signals, execution, monitoring).
+- `strategy.py`: signal engine.
+- `execution.py`: order execution, Binance filter rounding, TP/SL, OCO monitor.
+- `data_stream.py`: historical load + WebSocket + candle cache.
+- `risk.py`: cooldown, daily drawdown guard, loss pause logic.
+- `config.py`: `Settings` model and `.env` loading.
+- `indicators.py`: indicator helpers (used by auxiliary flows if needed).
+- `test_trade.py`: manual script to validate minimal order placement.
 
-## Requisitos
+## Requirements
 - Python 3.10+
-- Cuenta Binance Futures (testnet o real)
-- Dependencias:
+- Binance Futures account (testnet or live)
+- Dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Configuración
-Crear archivo `.env` en la raíz:
+## Configuration
+Create a `.env` file in the project root:
 
 ```env
-BINANCE_API_KEY=tu_api_key
-BINANCE_API_SECRET=tu_api_secret
+BINANCE_API_KEY=your_api_key
+BINANCE_API_SECRET=your_api_secret
 
 # Trading endpoint
 BINANCE_TESTNET=true
 BINANCE_DATA_TESTNET=false
 
-# Opcional: alertas Telegram
+# Optional: Telegram alerts
 TELEGRAM_BOT_TOKEN=xxxxxxxx
 TELEGRAM_CHAT_ID=123456789
 
-# Opcional: operación simulada
+# Optional: simulated trading
 USE_PAPER_TRADING=false
 PAPER_START_BALANCE=25
 
-# Opcional: riesgo
+# Optional: risk controls
 FIXED_MARGIN_PER_TRADE_USDT=5
 DAILY_DRAWDOWN_LIMIT_USDT=6
 ANTI_LIQ_TRIGGER_R=1.1
 ```
 
-## Parámetros clave (config.py)
-Estos son los más relevantes para operación:
+## Key Parameters (`config.py`)
+Most relevant runtime settings:
 
 - `main_interval` (default `15m`)
 - `context_interval` (default `1h`)
@@ -79,35 +79,35 @@ Estos son los más relevantes para operación:
 - `daily_drawdown_limit_usdt` (default `6.0`)
 - `history_candles_main` / `history_candles_context`
 
-## Ejecución
+## Run
 ```bash
 python main.py
 ```
 
-## Flujo operativo (resumen)
-1. Carga configuración y velas históricas.
-2. Inicia WebSocket multiplexer por chunks.
-3. En cada cierre de vela principal:
-   - evalúa señales en todos los símbolos,
-   - manda señales válidas por Telegram,
-   - ejecuta solo una si está permitido.
-4. Tras ejecutar:
-   - coloca TP/SL,
-   - inicia thread de protección/monitoreo,
-   - aplica reglas de salida/escala según estado.
+## Operational Flow (Summary)
+1. Load configuration and historical candles.
+2. Start WebSocket multiplexer in chunks.
+3. On each main candle close:
+   - evaluate signals across all symbols,
+   - send valid signals to Telegram,
+   - execute only one signal if allowed.
+4. After execution:
+   - place TP/SL,
+   - start a protection/monitoring thread,
+   - apply exit/scale rules based on runtime state.
 
 ## Logs
-- Consola: estado, heartbeat, warnings y errores.
-- Archivo: `logs/trades.log` (eventos de validación, entrada, salida, monitoreo).
+- Console: status, heartbeat, warnings, and errors.
+- File: `logs/trades.log` (validation, entry, exit, and monitor events).
 
-## Buenas prácticas
-- Empieza en `BINANCE_TESTNET=true`.
-- Usa `USE_PAPER_TRADING=true` para validar lógica sin riesgo.
-- No subas `.env` al repositorio.
-- Revisa `logs/trades.log` antes de ajustar parámetros.
+## Recommended Practices
+- Start with `BINANCE_TESTNET=true`.
+- Use `USE_PAPER_TRADING=true` to validate logic with no market risk.
+- Never commit your `.env` file.
+- Review `logs/trades.log` before tuning parameters.
 
-## Publicación en GitHub
-Este repositorio está preparado para push directo con:
+## GitHub Workflow
+Standard push flow:
 
 ```bash
 git add .
