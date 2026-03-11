@@ -142,9 +142,10 @@ def evaluate_signal(
     """Evaluate one symbol and return a normalized signal payload.
 
     Current ruleset:
-    - Strict 1H trend filter using EMA50 position and EMA50 slope.
-    - Simplified aggressive M15 continuation trigger.
-    - Relaxed volume confirmation (`>= 0.8 * avg5`).
+    - Strict 1H trend-strength filter (direction + minimum EMA50 slope).
+    - Volatility expansion required (ATR current vs ATR average).
+    - Breakout strength threshold, dominant candle body, and volume expansion.
+    - Aggressive continuation trigger without pullback logic.
 
     Parameters are kept to preserve the shared strategy interface used by
     `main.py`, even when some knobs are not used by this implementation.
@@ -186,9 +187,13 @@ def evaluate_signal(
         last["dif"],
         last["vol_avg5_prev"],
         last["atr"],
+        last["open"],
+        last["high"],
+        last["low"],
+        prev1["high"],
+        prev1["low"],
         h1_last["ema50"],
         h1_prev["ema50"],
-        last["atr"],
     ]
     if any(pd.isna(v) for v in required):
         return None
@@ -197,30 +202,68 @@ def evaluate_signal(
     if price <= 0:
         return None
 
-    # Strict 1H trend alignment.
+    # Strict 1H trend alignment + minimum slope strength.
     h1_close = float(h1_last["close"])
     h1_ema_last = float(h1_last["ema50"])
     h1_ema_prev = float(h1_prev["ema50"])
-    bias_long = h1_close > h1_ema_last and h1_ema_last > h1_ema_prev
-    bias_short = h1_close < h1_ema_last and h1_ema_last < h1_ema_prev
+    if h1_ema_prev == 0:
+        return None
+    h1_slope_ratio = abs(h1_ema_last - h1_ema_prev) / abs(h1_ema_prev)
+    slope_ok = h1_slope_ratio > 0.0005
+    bias_long = h1_close > h1_ema_last and h1_ema_last > h1_ema_prev and slope_ok
+    bias_short = h1_close < h1_ema_last and h1_ema_last < h1_ema_prev and slope_ok
+    if not (bias_long or bias_short):
+        return None
 
+    atr_val = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
+    atr_avg = float(m15["atr"].rolling(window=20).mean().iloc[-1]) if len(m15) >= 25 else 0.0
+    if atr_val <= 0 or atr_avg <= 0:
+        return None
+    if atr_val < (atr_avg * 1.05):
+        return None
+
+    # Candle dominance filter.
+    candle_range = float(last["high"] - last["low"])
+    if candle_range <= 0:
+        return None
+    body = abs(float(last["close"] - last["open"]))
+    body_ratio = body / candle_range
+    if body_ratio < 0.6:
+        return None
+
+    # Volume expansion filter.
     vol_avg5 = float(last["vol_avg5_prev"] or 0.0)
-    vol_confirm_ok = vol_avg5 > 0 and float(last["volume"]) >= (vol_avg5 * 0.8)
+    vol_confirm_ok = vol_avg5 > 0 and float(last["volume"]) >= (vol_avg5 * 1.2)
     if not vol_confirm_ok:
         return None
 
-    # Simplified aggressive continuation entries.
+    # Breakout strength filter.
+    prev_high = float(prev1["high"])
+    prev_low = float(prev1["low"])
+    long_breakout_strength = ((price - prev_high) / prev_high) if prev_high > 0 else 0.0
+    short_breakout_strength = ((prev_low - price) / prev_low) if prev_low > 0 else 0.0
+
+    # Core continuation direction logic with EMA-distance requirement.
+    ema7_last = float(last["ema7"])
+    ema25_last = float(last["ema25"])
+    ema_distance_long = ((price - ema7_last) / price) if price > 0 else 0.0
+    ema_distance_short = ((ema7_last - price) / price) if price > 0 else 0.0
+
     long_impulse = (
-        float(last["ema7"]) > float(last["ema25"])
-        and price > float(last["ema7"])
+        ema7_last > ema25_last
+        and price > ema7_last
         and float(last["dif"]) > 0
-        and float(last["close"]) > float(prev1["high"])
+        and price > prev_high
+        and long_breakout_strength > 0.004
+        and ema_distance_long > 0.0015
     )
     short_impulse = (
-        float(last["ema7"]) < float(last["ema25"])
-        and price < float(last["ema7"])
+        ema7_last < ema25_last
+        and price < ema7_last
         and float(last["dif"]) < 0
-        and float(last["close"]) < float(prev1["low"])
+        and price < prev_low
+        and short_breakout_strength > 0.004
+        and ema_distance_short > 0.0015
     )
 
     breakout_ts = last.get("close_time")
@@ -229,8 +272,6 @@ def evaluate_signal(
     else:
         breakout_time = str(breakout_ts)
 
-    atr_val = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
-    atr_avg = float(m15["atr"].rolling(window=20).mean().iloc[-1]) if len(m15) >= 25 else 0.0
     swing_w = m15.iloc[-(SWING_LOOKBACK + 1):-1]
 
     if bias_long and long_impulse:

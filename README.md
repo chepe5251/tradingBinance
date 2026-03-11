@@ -11,7 +11,7 @@ This software can open and close real positions. Use it at your own risk. Start 
 
 ## Core Features
 - Full USDT perpetual symbol universe scanning (no hard symbol cap by default).
-- Signal strategy on `M15` with strict `1H` bias alignment.
+- Signal strategy on `M15` with strict `1H` trend-strength alignment.
 - Sends **all** valid signals to Telegram.
 - Executes only the first valid signal when:
   - `RiskManager` allows trading, and
@@ -19,7 +19,20 @@ This software can open and close real positions. Use it at your own risk. Start 
 - Limit entry with market fallback.
 - Mandatory TP/SL with automatic recovery if protection orders are lost.
 - Floating-loss scaling (levels defined in current logic).
+- Telegram anti-spam protection with rate-limit handling (`HTTP 429` retry).
 - WebSocket heartbeat and automatic restart.
+
+## Strategy Profile (Current)
+The strategy is intentionally selective and expansion-focused to reduce noise
+across the full symbol universe.
+
+Entry filters include:
+- Strict 1H EMA50 direction + minimum EMA50 slope strength.
+- ATR expansion requirement (`ATR current >= 1.05 * ATR avg(20)`).
+- Breakout strength threshold (`> 0.4%` over previous candle extreme).
+- Dominant momentum candle (`body/range >= 0.6`).
+- Volume expansion (`volume >= 1.2 * avg volume(5)`).
+- Minimum distance from EMA7 (`> 0.15%`) to avoid weak glued entries.
 
 ## Architecture
 - `main.py`: orchestration (stream, signals, execution, monitoring).
