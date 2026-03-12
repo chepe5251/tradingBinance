@@ -22,7 +22,7 @@ MACD_SIGNAL = 9
 MAX_MOVE_WITHOUT_PULLBACK = 0.018  # 1.8%
 MIN_DISTANCE_TO_LEVEL = 0.01  # 1%
 VOL_CONFIRM_WINDOW = 5
-RANGE_MAX_CROSSES = 2
+RANGE_MAX_CROSSES = 3
 RANGE_CROSS_LOOKBACK = 15
 SWING_LOOKBACK = 8
 MIN_RR_TARGET = 1.8
@@ -168,9 +168,9 @@ def evaluate_signal(
     """Evaluate one symbol and return a normalized signal payload.
 
     Current ruleset:
-    - Strict 1H trend alignment with EMA50 slope and 1H MACD DIF direction.
-    - Conservative M15 continuation with mandatory pullback structure.
-    - Strong anti-chop, anti-climax, and volume quality gates.
+    - Strict 1H directional filter (price vs EMA50 + EMA50 slope).
+    - M15 trend alignment with early pullback-entry trigger.
+    - Anti-range, anti-late-entry, and volume confirmation filters.
 
     Parameters are kept to preserve the shared strategy interface used by
     `main.py`, even when some knobs are not used by this implementation.
@@ -181,7 +181,7 @@ def evaluate_signal(
 
     if main_df.empty or context_df.empty:
         return None
-    if len(main_df) < 70 or len(context_df) < 80:
+    if len(main_df) < 70 or len(context_df) < 70:
         return None
 
     m15 = main_df.copy()
@@ -198,8 +198,6 @@ def evaluate_signal(
     m15["hist"] = hist
 
     h1["ema50"] = _ema(h1["close"], EMA_BIAS_1H)
-    h1_dif, _, _ = _macd(h1["close"])
-    h1["dif"] = h1_dif
 
     last = m15.iloc[-1]
     prev1 = m15.iloc[-2]
@@ -224,16 +222,12 @@ def evaluate_signal(
         prev1["volume"],
         prev1["ema25"],
         prev2["volume"],
-        prev3["volume"],
         prev2["open"],
         prev2["close"],
         prev3["open"],
         prev3["close"],
-        m15["hist"].iloc[-2],
-        m15["hist"].iloc[-3],
         h1_last["ema50"],
         h1_prev["ema50"],
-        h1_last["dif"],
     ]
     if any(pd.isna(v) for v in required):
         return None
@@ -246,28 +240,17 @@ def evaluate_signal(
     if _is_flat_range(m15["ema7"], m15["ema25"]):
         return None
 
-    # Strict 1H structure filter.
+    # Strict 1H filter.
     h1_close = float(h1_last["close"])
     h1_ema_last = float(h1_last["ema50"])
     h1_ema_prev = float(h1_prev["ema50"])
-    h1_dif_last = float(h1_last["dif"])
-
-    h1_pivot_lows = _recent_pivot_lows(h1, lookback=120)
-    h1_pivot_highs = _recent_pivot_highs(h1, lookback=120)
-    has_higher_lows = len(h1_pivot_lows) >= 2 and h1_pivot_lows[-1] > h1_pivot_lows[-2]
-    has_lower_highs = len(h1_pivot_highs) >= 2 and h1_pivot_highs[-1] < h1_pivot_highs[-2]
-
     bias_long = (
         h1_close > h1_ema_last
         and h1_ema_last > h1_ema_prev
-        and h1_dif_last > 0
-        and has_higher_lows
     )
     bias_short = (
         h1_close < h1_ema_last
         and h1_ema_last < h1_ema_prev
-        and h1_dif_last < 0
-        and has_lower_highs
     )
     if not (bias_long or bias_short):
         return None
@@ -277,36 +260,29 @@ def evaluate_signal(
     if atr_val <= 0 or atr_avg <= 0:
         return None
 
-    # Block expansion entries.
+    # Block late entries.
     candle_range = float(last["high"] - last["low"])
     if candle_range <= 0:
         return None
-    if candle_range > (2.0 * atr_val):
+    if candle_range > (1.6 * atr_val):
         return None
 
     ema7_last = float(last["ema7"])
     ema25_last = float(last["ema25"])
     ema_distance_pct = abs(price - ema7_last) / price if price > 0 else 0.0
-    if ema_distance_pct > 0.012:
+    if ema_distance_pct > 0.008:
+        return None
+
+    body = abs(float(last["close"] - last["open"]))
+    body_ratio = body / candle_range if candle_range > 0 else 0.0
+    if body_ratio > 0.85:
         return None
 
     # Volume filter.
     vol_avg5 = float(last["vol_avg5_prev"] or 0.0)
     vol_last = float(last["volume"])
-    vol_confirm_ok = vol_avg5 > 0 and vol_last >= vol_avg5
+    vol_confirm_ok = vol_avg5 > 0 and vol_last >= (vol_avg5 * 0.9)
     if not vol_confirm_ok:
-        return None
-
-    # Reject isolated volume spikes without continuation quality.
-    prev1_vol = float(prev1["volume"])
-    prev2_vol = float(prev2["volume"])
-    isolated_spike = (
-        vol_avg5 > 0
-        and vol_last >= (vol_avg5 * 2.5)
-        and prev1_vol < vol_avg5
-        and prev2_vol < vol_avg5
-    )
-    if isolated_spike:
         return None
 
     prev1_open = float(prev1["open"])
@@ -320,59 +296,50 @@ def evaluate_signal(
     prev3_open = float(prev3["open"])
     prev3_close = float(prev3["close"])
 
-    hist_last = float(last["hist"])
-    hist_prev1 = float(prev1["hist"])
-    hist_prev2 = float(prev2["hist"])
-
-    # Structured pullback + momentum confirmation.
-    long_prior_impulse = prev2_close > prev2_open and prev2_close > prev3_close
-    short_prior_impulse = prev2_close < prev2_open and prev2_close < prev3_close
-
-    long_hist_ok = hist_last > hist_prev1 > hist_prev2
-    short_hist_ok = hist_last < hist_prev1 < hist_prev2
-
-    # No decreasing volume during impulse.
-    long_impulse_vol_ok = not (
-        prev2_close > prev2_open
-        and prev3_close > prev3_open
-        and float(prev2["volume"]) < float(prev3["volume"])
-    )
-    short_impulse_vol_ok = not (
-        prev2_close < prev2_open
-        and prev3_close < prev3_open
-        and float(prev2["volume"]) < float(prev3["volume"])
-    )
-
     swing_w = m15.iloc[-(SWING_LOOKBACK + 1):-1]
     swing_low = float(swing_w["low"].min()) if not swing_w.empty else float(prev1["low"])
     swing_high = float(swing_w["high"].max()) if not swing_w.empty else float(prev1["high"])
 
-    swing_distance_long = ((price - swing_low) / swing_low) if swing_low > 0 else 0.0
-    swing_distance_short = ((swing_high - price) / swing_high) if swing_high > 0 else 0.0
+    dif_last = float(last["dif"])
 
+    # Pullback structure: allow 1-2 opposite candles, no more.
+    red1 = prev1_close < prev1_open
+    red2 = prev2_close < prev2_open
+    red3 = prev3_close < prev3_open
+    green1 = prev1_close > prev1_open
+    green2 = prev2_close > prev2_open
+    green3 = prev3_close > prev3_open
+
+    pb_range = float(prev1_high - prev1_low)
+    pb_body = abs(float(prev1_close - prev1_open))
+    pb_body_ratio = (pb_body / pb_range) if pb_range > 0 else 1.0
+
+    # Early trigger: break pullback candle high/low, no giant breakout required.
     long_impulse = (
+        bias_long
+        and
         ema7_last > ema25_last
-        and long_prior_impulse
+        and dif_last > 0
+        and red1
+        and not (red1 and red2 and red3)
         and prev1_close < prev1_open
         and prev1_low >= prev1_ema25
-        and price > prev1_high
-        and price > ema7_last
-        and float(last["dif"]) > 0
-        and long_hist_ok
-        and long_impulse_vol_ok
-        and swing_distance_long <= 0.02
+        and pb_body_ratio <= 0.6
+        and float(last["high"]) > prev1_high
+        and price > prev1_close
     )
     short_impulse = (
+        bias_short
+        and
         ema7_last < ema25_last
-        and short_prior_impulse
+        and dif_last < 0
+        and green1
+        and not (green1 and green2 and green3)
         and prev1_close > prev1_open
         and prev1_high <= prev1_ema25
-        and price < prev1_low
-        and price < ema7_last
-        and float(last["dif"]) < 0
-        and short_hist_ok
-        and short_impulse_vol_ok
-        and swing_distance_short <= 0.02
+        and pb_body_ratio <= 0.6
+        and float(last["low"]) < prev1_low
+        and price < prev1_close
     )
 
     breakout_ts = last.get("close_time")
@@ -381,28 +348,25 @@ def evaluate_signal(
     else:
         breakout_time = str(breakout_ts)
 
-    if bias_long and long_impulse:
+    if long_impulse:
         stop_price = swing_low
         risk_per_unit = price - stop_price
         if risk_per_unit <= 0:
             return None
-        # Signal ranking score (higher is better).
+        # Keep score for ranking while favoring early, clean pullbacks.
         h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
-        momentum_strength = max(0.0, hist_last - hist_prev1)
+        pullback_quality = max(0.0, 0.65 - pb_body_ratio)
         rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
         volume_strength = vol_last / max(vol_avg5, 1e-9)
-        vol_penalty = max(0.0, (candle_range / atr_val) - 1.2)
-        ema_penalty = max(0.0, (ema_distance_pct - 0.006) * 120.0)
-        weak_slope_penalty = 0.5 if h1_slope_strength < 0.0008 else 0.0
+        late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
+        ema_penalty = max(0.0, (ema_distance_pct - 0.004) * 100.0)
         score = (
-            min(3.0, h1_slope_strength * 3500.0)
-            + min(2.5, momentum_strength * 1200.0)
+            min(3.0, h1_slope_strength * 2500.0)
+            + min(2.0, pullback_quality * 6.0)
             + min(2.0, rr_vs_atr)
             + min(1.5, max(0.0, volume_strength - 1.0))
-            + 1.0
-            - min(2.0, vol_penalty)
+            - min(2.0, late_penalty)
             - min(1.5, ema_penalty)
-            - weak_slope_penalty
         )
         score = round(max(0.0, score), 2)
         return {
@@ -424,27 +388,24 @@ def evaluate_signal(
             "score": score,
         }
 
-    if bias_short and short_impulse:
+    if short_impulse:
         stop_price = swing_high
         risk_per_unit = stop_price - price
         if risk_per_unit <= 0:
             return None
         h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
-        momentum_strength = max(0.0, hist_prev1 - hist_last)
+        pullback_quality = max(0.0, 0.65 - pb_body_ratio)
         rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
         volume_strength = vol_last / max(vol_avg5, 1e-9)
-        vol_penalty = max(0.0, (candle_range / atr_val) - 1.2)
-        ema_penalty = max(0.0, (ema_distance_pct - 0.006) * 120.0)
-        weak_slope_penalty = 0.5 if h1_slope_strength < 0.0008 else 0.0
+        late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
+        ema_penalty = max(0.0, (ema_distance_pct - 0.004) * 100.0)
         score = (
-            min(3.0, h1_slope_strength * 3500.0)
-            + min(2.5, momentum_strength * 1200.0)
+            min(3.0, h1_slope_strength * 2500.0)
+            + min(2.0, pullback_quality * 6.0)
             + min(2.0, rr_vs_atr)
             + min(1.5, max(0.0, volume_strength - 1.0))
-            + 1.0
-            - min(2.0, vol_penalty)
+            - min(2.0, late_penalty)
             - min(1.5, ema_penalty)
-            - weak_slope_penalty
         )
         score = round(max(0.0, score), 2)
         return {

@@ -23,27 +23,32 @@ This software can open and close real positions. Use it at your own risk. Start 
 - WebSocket heartbeat and automatic restart.
 
 ## Strategy Profile (Current)
-The strategy is intentionally selective and continuation-focused to reduce noise
-across the full symbol universe.
+The strategy is selective and continuation-focused, designed for earlier entries
+near the end of pullbacks (not late expansion candles).
 
 Entry filters include:
-- Strict 1H structure filter:
-  - LONG: `close > EMA50`, `EMA50 rising`, plus higher-lows structure.
-  - SHORT: `close < EMA50`, `EMA50 falling`, plus lower-highs structure.
-- Strong anti-chop filter using EMA7/EMA25 crossing frequency:
-  - lookback `15`, max crossings `2`
-- Mandatory pullback structure before trigger:
-  - LONG: previous candle red, low holds above EMA25, then close breaks previous high
-  - SHORT: previous candle green, high stays below EMA25, then close breaks previous low
-- Momentum confirmation:
-  - MACD histogram must strengthen in signal direction for 2 consecutive candles
-  - volume must confirm and impulse must not show decaying volume
-- Expansion-entry blockers:
-  - reject if candle range is too large relative to ATR
-  - reject if price is too extended from EMA7 or recent swing extremes
+- Strict 1H directional filter:
+  - LONG: `close > EMA50` and `EMA50 rising`
+  - SHORT: `close < EMA50` and `EMA50 falling`
+- M15 trend alignment:
+  - LONG: `EMA7 > EMA25` and `DIF > 0`
+  - SHORT: `EMA7 < EMA25` and `DIF < 0`
+- Structured small pullback requirement:
+  - only `1` or `2` opposite candles allowed
+  - pullback candle body must be small (`body/range <= 0.6`)
+  - LONG pullback low must hold above EMA25
+  - SHORT pullback high must hold below EMA25
+- Early entry trigger:
+  - LONG: current candle breaks pullback high and closes above pullback close
+  - SHORT: current candle breaks pullback low and closes below pullback close
+- Late-entry blockers:
+  - reject if current range `> 1.6 * ATR`
+  - reject if distance from EMA7 `> 0.8%`
+  - reject if current `body/range > 0.85`
 - Volume quality gate:
-  - current volume must be at least `avg volume(5)`
-  - reject isolated volume spikes without continuation structure
+  - current volume must be at least `0.9 * avg volume(5)`
+- Anti-chop range filter:
+  - reject if EMA7/EMA25 crossed more than `2` times over last `15` candles
 - Score-based ranking:
   - every valid signal gets a numeric `score`
   - the engine sorts signals and executes only the top score each cycle
