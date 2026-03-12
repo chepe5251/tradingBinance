@@ -1,8 +1,8 @@
-"""Signal engine for aggressive M15 continuation entries.
+"""Signal engine for conservative M15 continuation entries.
 
 Design goals:
-- High signal throughput across a broad symbol universe.
-- Strict 1H directional alignment to avoid trading against bias.
+- Reduce low-quality breakouts across a broad symbol universe.
+- Enforce strict 1H directional/trend-strength alignment.
 - Keep output schema stable for `main.py` and downstream execution code.
 """
 from __future__ import annotations
@@ -22,8 +22,8 @@ MACD_SIGNAL = 9
 MAX_MOVE_WITHOUT_PULLBACK = 0.018  # 1.8%
 MIN_DISTANCE_TO_LEVEL = 0.01  # 1%
 VOL_CONFIRM_WINDOW = 5
-RANGE_CROSS_LOOKBACK = 12
-RANGE_MAX_CROSSES = 3
+RANGE_MAX_CROSSES = 2
+RANGE_CROSS_LOOKBACK = 15
 SWING_LOOKBACK = 8
 MIN_RR_TARGET = 1.8
 
@@ -142,10 +142,9 @@ def evaluate_signal(
     """Evaluate one symbol and return a normalized signal payload.
 
     Current ruleset:
-    - Strict 1H trend-strength filter (direction + minimum EMA50 slope).
-    - Volatility expansion required (ATR current vs ATR average).
-    - Breakout strength threshold, dominant candle body, and volume expansion.
-    - Aggressive continuation trigger without pullback logic.
+    - Strict 1H trend alignment with EMA50 slope and 1H MACD DIF direction.
+    - Conservative M15 continuation with mandatory pullback structure.
+    - Strong anti-chop, anti-climax, and volume quality gates.
 
     Parameters are kept to preserve the shared strategy interface used by
     `main.py`, even when some knobs are not used by this implementation.
@@ -178,6 +177,7 @@ def evaluate_signal(
 
     last = m15.iloc[-1]
     prev1 = m15.iloc[-2]
+    prev2 = m15.iloc[-3]
     h1_last = h1.iloc[-1]
     h1_prev = h1.iloc[-2]
 
@@ -192,8 +192,14 @@ def evaluate_signal(
         last["low"],
         prev1["high"],
         prev1["low"],
+        prev1["open"],
+        prev1["close"],
+        prev1["volume"],
+        prev1["ema25"],
+        prev2["volume"],
         h1_last["ema50"],
         h1_prev["ema50"],
+        h1_last["dif"],
     ]
     if any(pd.isna(v) for v in required):
         return None
@@ -202,16 +208,25 @@ def evaluate_signal(
     if price <= 0:
         return None
 
-    # Strict 1H trend alignment + minimum slope strength.
+    # Strong range filter to suppress choppy regimes.
+    if _is_flat_range(m15["ema7"], m15["ema25"]):
+        return None
+
+    # Strict 1H trend alignment.
     h1_close = float(h1_last["close"])
     h1_ema_last = float(h1_last["ema50"])
     h1_ema_prev = float(h1_prev["ema50"])
-    if h1_ema_prev == 0:
-        return None
-    h1_slope_ratio = abs(h1_ema_last - h1_ema_prev) / abs(h1_ema_prev)
-    slope_ok = h1_slope_ratio > 0.0005
-    bias_long = h1_close > h1_ema_last and h1_ema_last > h1_ema_prev and slope_ok
-    bias_short = h1_close < h1_ema_last and h1_ema_last < h1_ema_prev and slope_ok
+    h1_dif_last = float(h1_last["dif"])
+    bias_long = (
+        h1_close > h1_ema_last
+        and h1_ema_last > h1_ema_prev
+        and h1_dif_last > 0
+    )
+    bias_short = (
+        h1_close < h1_ema_last
+        and h1_ema_last < h1_ema_prev
+        and h1_dif_last < 0
+    )
     if not (bias_long or bias_short):
         return None
 
@@ -219,51 +234,58 @@ def evaluate_signal(
     atr_avg = float(m15["atr"].rolling(window=20).mean().iloc[-1]) if len(m15) >= 25 else 0.0
     if atr_val <= 0 or atr_avg <= 0:
         return None
-    if atr_val < (atr_avg * 1.05):
-        return None
 
-    # Candle dominance filter.
+    # Block climactic candles.
     candle_range = float(last["high"] - last["low"])
     if candle_range <= 0:
         return None
-    body = abs(float(last["close"] - last["open"]))
-    body_ratio = body / candle_range
-    if body_ratio < 0.6:
+    if candle_range > (2.2 * atr_val):
         return None
 
-    # Volume expansion filter.
+    # Volume filter.
     vol_avg5 = float(last["vol_avg5_prev"] or 0.0)
-    vol_confirm_ok = vol_avg5 > 0 and float(last["volume"]) >= (vol_avg5 * 1.2)
+    vol_last = float(last["volume"])
+    vol_confirm_ok = vol_avg5 > 0 and vol_last >= vol_avg5
     if not vol_confirm_ok:
         return None
 
-    # Breakout strength filter.
-    prev_high = float(prev1["high"])
-    prev_low = float(prev1["low"])
-    long_breakout_strength = ((price - prev_high) / prev_high) if prev_high > 0 else 0.0
-    short_breakout_strength = ((prev_low - price) / prev_low) if prev_low > 0 else 0.0
+    # Reject isolated volume spikes without continuation quality.
+    prev1_vol = float(prev1["volume"])
+    prev2_vol = float(prev2["volume"])
+    isolated_spike = (
+        vol_avg5 > 0
+        and vol_last >= (vol_avg5 * 2.5)
+        and prev1_vol < vol_avg5
+        and prev2_vol < vol_avg5
+    )
+    if isolated_spike:
+        return None
 
-    # Core continuation direction logic with EMA-distance requirement.
+    prev1_open = float(prev1["open"])
+    prev1_close = float(prev1["close"])
+    prev1_high = float(prev1["high"])
+    prev1_low = float(prev1["low"])
+    prev1_ema25 = float(prev1["ema25"])
+
+    # Core continuation direction logic with required pullback structure.
     ema7_last = float(last["ema7"])
     ema25_last = float(last["ema25"])
-    ema_distance_long = ((price - ema7_last) / price) if price > 0 else 0.0
-    ema_distance_short = ((ema7_last - price) / price) if price > 0 else 0.0
 
     long_impulse = (
         ema7_last > ema25_last
+        and prev1_close < prev1_open
+        and prev1_low >= prev1_ema25
+        and price > prev1_high
         and price > ema7_last
         and float(last["dif"]) > 0
-        and price > prev_high
-        and long_breakout_strength > 0.004
-        and ema_distance_long > 0.0015
     )
     short_impulse = (
         ema7_last < ema25_last
+        and prev1_close > prev1_open
+        and prev1_high <= prev1_ema25
+        and price < prev1_low
         and price < ema7_last
         and float(last["dif"]) < 0
-        and price < prev_low
-        and short_breakout_strength > 0.004
-        and ema_distance_short > 0.0015
     )
 
     breakout_ts = last.get("close_time")

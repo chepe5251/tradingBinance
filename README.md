@@ -23,16 +23,23 @@ This software can open and close real positions. Use it at your own risk. Start 
 - WebSocket heartbeat and automatic restart.
 
 ## Strategy Profile (Current)
-The strategy is intentionally selective and expansion-focused to reduce noise
+The strategy is intentionally selective and continuation-focused to reduce noise
 across the full symbol universe.
 
 Entry filters include:
-- Strict 1H EMA50 direction + minimum EMA50 slope strength.
-- ATR expansion requirement (`ATR current >= 1.05 * ATR avg(20)`).
-- Breakout strength threshold (`> 0.4%` over previous candle extreme).
-- Dominant momentum candle (`body/range >= 0.6`).
-- Volume expansion (`volume >= 1.2 * avg volume(5)`).
-- Minimum distance from EMA7 (`> 0.15%`) to avoid weak glued entries.
+- Strict 1H direction filter:
+  - LONG: `close > EMA50`, `EMA50 rising`, `MACD DIF > 0`
+  - SHORT: `close < EMA50`, `EMA50 falling`, `MACD DIF < 0`
+- Strong anti-chop filter using EMA7/EMA25 crossing frequency:
+  - lookback `15`, max crossings `2`
+- Mandatory pullback structure before trigger:
+  - LONG: previous candle red, low holds above EMA25, then close breaks previous high
+  - SHORT: previous candle green, high stays below EMA25, then close breaks previous low
+- Climactic-candle rejection:
+  - ignore setups when current range is greater than `2.2 * ATR`
+- Volume quality gate:
+  - current volume must be at least `avg volume(5)`
+  - reject isolated volume spikes without continuation structure
 
 ## Architecture
 - `main.py`: orchestration (stream, signals, execution, monitoring).
