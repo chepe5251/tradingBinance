@@ -567,7 +567,6 @@ def main() -> None:
                 active_positions += 1
         has_open_position = active_positions > 0
 
-        best: tuple[str, dict] | None = None
         valid_signals: list[tuple[str, dict]] = []
 
         for sym in symbols:
@@ -607,11 +606,15 @@ def main() -> None:
             )
             candidate = (sym, signal)
             valid_signals.append(candidate)
-            if best is None:
-                best = candidate
 
-        if not valid_signals or not best:
+        if not valid_signals:
             return
+
+        valid_signals.sort(
+            key=lambda item: float((item[1] or {}).get("score") or 0.0),
+            reverse=True,
+        )
+        best = valid_signals[0]
 
         execution_allowed = can_trade_now and not has_open_position
         block_reason = ""

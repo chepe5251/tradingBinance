@@ -27,19 +27,26 @@ The strategy is intentionally selective and continuation-focused to reduce noise
 across the full symbol universe.
 
 Entry filters include:
-- Strict 1H direction filter:
-  - LONG: `close > EMA50`, `EMA50 rising`, `MACD DIF > 0`
-  - SHORT: `close < EMA50`, `EMA50 falling`, `MACD DIF < 0`
+- Strict 1H structure filter:
+  - LONG: `close > EMA50`, `EMA50 rising`, plus higher-lows structure.
+  - SHORT: `close < EMA50`, `EMA50 falling`, plus lower-highs structure.
 - Strong anti-chop filter using EMA7/EMA25 crossing frequency:
   - lookback `15`, max crossings `2`
 - Mandatory pullback structure before trigger:
   - LONG: previous candle red, low holds above EMA25, then close breaks previous high
   - SHORT: previous candle green, high stays below EMA25, then close breaks previous low
-- Climactic-candle rejection:
-  - ignore setups when current range is greater than `2.2 * ATR`
+- Momentum confirmation:
+  - MACD histogram must strengthen in signal direction for 2 consecutive candles
+  - volume must confirm and impulse must not show decaying volume
+- Expansion-entry blockers:
+  - reject if candle range is too large relative to ATR
+  - reject if price is too extended from EMA7 or recent swing extremes
 - Volume quality gate:
   - current volume must be at least `avg volume(5)`
   - reject isolated volume spikes without continuation structure
+- Score-based ranking:
+  - every valid signal gets a numeric `score`
+  - the engine sorts signals and executes only the top score each cycle
 
 ## Architecture
 - `main.py`: orchestration (stream, signals, execution, monitoring).
