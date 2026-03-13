@@ -18,9 +18,6 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Retained legacy constants for compatibility and potential toggles.
-MAX_MOVE_WITHOUT_PULLBACK = 0.018  # 1.8%
-MIN_DISTANCE_TO_LEVEL = 0.01  # 1%
 VOL_CONFIRM_WINDOW = 5
 RANGE_MAX_CROSSES = 3
 RANGE_CROSS_LOOKBACK = 15
@@ -60,59 +57,6 @@ def _atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def _is_pivot_high(high: pd.Series, idx: int, wing: int = 2) -> bool:
-    """Check if `idx` is a local pivot high in a symmetric window."""
-    val = float(high.iloc[idx])
-    left = high.iloc[idx - wing:idx]
-    right = high.iloc[idx + 1:idx + 1 + wing]
-    if left.empty or right.empty:
-        return False
-    return bool((val >= left.max()) and (val >= right.max()))
-
-
-def _is_pivot_low(low: pd.Series, idx: int, wing: int = 2) -> bool:
-    """Check if `idx` is a local pivot low in a symmetric window."""
-    val = float(low.iloc[idx])
-    left = low.iloc[idx - wing:idx]
-    right = low.iloc[idx + 1:idx + 1 + wing]
-    if left.empty or right.empty:
-        return False
-    return bool((val <= left.min()) and (val <= right.min()))
-
-
-def _extract_levels(df: pd.DataFrame, lookback: int = 180) -> tuple[list[float], list[float]]:
-    """Extract support/resistance candidates from pivot highs/lows."""
-    if df.empty or len(df) < 12:
-        return [], []
-    w = df.iloc[-lookback:].copy() if len(df) > lookback else df.copy()
-    highs = w["high"].reset_index(drop=True)
-    lows = w["low"].reset_index(drop=True)
-    resistances: list[float] = []
-    supports: list[float] = []
-    for i in range(2, len(w) - 2):
-        if _is_pivot_high(highs, i):
-            resistances.append(float(highs.iloc[i]))
-        if _is_pivot_low(lows, i):
-            supports.append(float(lows.iloc[i]))
-    if not resistances:
-        resistances.append(float(highs.max()))
-    if not supports:
-        supports.append(float(lows.min()))
-    return resistances, supports
-
-
-def _nearest_above(price: float, levels: list[float]) -> float | None:
-    """Return nearest level above `price`."""
-    cands = [x for x in levels if x > price]
-    return min(cands) if cands else None
-
-
-def _nearest_below(price: float, levels: list[float]) -> float | None:
-    """Return nearest level below `price`."""
-    cands = [x for x in levels if x < price]
-    return max(cands) if cands else None
-
-
 def _is_flat_range(ema_fast: pd.Series, ema_mid: pd.Series) -> bool:
     """Detect frequent EMA crossover behavior often associated with ranges."""
     if len(ema_fast) < RANGE_CROSS_LOOKBACK or len(ema_mid) < RANGE_CROSS_LOOKBACK:
@@ -122,31 +66,6 @@ def _is_flat_range(ema_fast: pd.Series, ema_mid: pd.Series) -> bool:
     crosses = int((sign != sign.shift(1)).sum())
     return crosses >= RANGE_MAX_CROSSES
 
-
-def _recent_pivot_lows(df: pd.DataFrame, lookback: int = 120) -> list[float]:
-    """Return pivot-low values (oldest->newest) from a recent window."""
-    if df.empty or len(df) < 10:
-        return []
-    w = df.iloc[-lookback:].copy() if len(df) > lookback else df.copy()
-    lows = w["low"].reset_index(drop=True)
-    pivots: list[float] = []
-    for i in range(2, len(lows) - 2):
-        if _is_pivot_low(lows, i):
-            pivots.append(float(lows.iloc[i]))
-    return pivots
-
-
-def _recent_pivot_highs(df: pd.DataFrame, lookback: int = 120) -> list[float]:
-    """Return pivot-high values (oldest->newest) from a recent window."""
-    if df.empty or len(df) < 10:
-        return []
-    w = df.iloc[-lookback:].copy() if len(df) > lookback else df.copy()
-    highs = w["high"].reset_index(drop=True)
-    pivots: list[float] = []
-    for i in range(2, len(highs) - 2):
-        if _is_pivot_high(highs, i):
-            pivots.append(float(highs.iloc[i]))
-    return pivots
 
 
 def evaluate_signal(
@@ -198,6 +117,7 @@ def evaluate_signal(
     m15["hist"] = hist
 
     h1["ema50"] = _ema(h1["close"], EMA_BIAS_1H)
+    h1["atr"] = _atr(h1, atr_period)
 
     last = m15.iloc[-1]
     prev1 = m15.iloc[-2]
@@ -231,7 +151,9 @@ def evaluate_signal(
         prev3["open"],
         prev3["close"],
         h1_last["ema50"],
+        h1_last["atr"],
         h1_prev["ema50"],
+        h1_prev["close"],
     ]
     if any(pd.isna(v) for v in required):
         return None
@@ -248,20 +170,24 @@ def evaluate_signal(
     h1_close = float(h1_last["close"])
     h1_ema_last = float(h1_last["ema50"])
     h1_ema_prev = float(h1_prev["ema50"])
+    h1_prev_close = float(h1_prev["close"])
     bias_long = (
         h1_close > h1_ema_last
         and h1_ema_last > h1_ema_prev
+        and h1_prev_close > h1_ema_prev
     )
     bias_short = (
         h1_close < h1_ema_last
         and h1_ema_last < h1_ema_prev
+        and h1_prev_close < h1_ema_prev
     )
     if not (bias_long or bias_short):
         return None
 
     atr_val = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
     atr_avg = float(m15["atr"].rolling(window=20).mean().iloc[-1]) if len(m15) >= 25 else 0.0
-    if atr_val <= 0 or atr_avg <= 0:
+    atr_1h = float(h1_last["atr"]) if not pd.isna(h1_last["atr"]) else 0.0
+    if atr_val <= 0 or atr_avg <= 0 or atr_1h <= 0:
         return None
 
     # Block late entries.
@@ -305,6 +231,8 @@ def evaluate_signal(
     swing_low = float(swing_w["low"].min()) if not swing_w.empty else float(prev1["low"])
     swing_high = float(swing_w["high"].max()) if not swing_w.empty else float(prev1["high"])
     impulse_leg = swing_high - swing_low
+    if impulse_leg < atr_val * 1.0:
+        return None
 
     dif_last = float(last["dif"])
 
@@ -377,20 +305,20 @@ def evaluate_signal(
     if long_impulse:
         if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
             return None
-        stop_price = swing_low
+        stop_price = max(swing_low, price - atr_val * 2.0)
         risk_per_unit = price - stop_price
         if risk_per_unit <= 0:
             return None
         if risk_per_unit < atr_val * 0.5:
             return None
         # Keep score for ranking while favoring early, clean pullbacks.
-        h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
+        h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(atr_1h, 1e-9)
         pullback_quality = max(0.0, 0.65 - pb_body_ratio)
         rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
         score = (
-            min(3.0, h1_slope_strength * 2500.0)
+            min(3.0, h1_slope_strength * 20.0)
             + min(2.0, pullback_quality * 6.0)
             + min(2.0, rr_vs_atr)
             + min(1.5, max(0.0, volume_strength - 1.0))
@@ -422,19 +350,19 @@ def evaluate_signal(
     if short_impulse:
         if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
             return None
-        stop_price = swing_high
+        stop_price = min(swing_high, price + atr_val * 2.0)
         risk_per_unit = stop_price - price
         if risk_per_unit <= 0:
             return None
         if risk_per_unit < atr_val * 0.5:
             return None
-        h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
+        h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(atr_1h, 1e-9)
         pullback_quality = max(0.0, 0.65 - pb_body_ratio)
         rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
         score = (
-            min(3.0, h1_slope_strength * 2500.0)
+            min(3.0, h1_slope_strength * 20.0)
             + min(2.0, pullback_quality * 6.0)
             + min(2.0, rr_vs_atr)
             + min(1.5, max(0.0, volume_strength - 1.0))

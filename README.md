@@ -27,9 +27,9 @@ The strategy is selective and continuation-focused, designed for earlier entries
 near the end of pullbacks (not late expansion candles).
 
 Entry filters include:
-- Strict 1H directional filter:
-  - LONG: `close > EMA50` and `EMA50 rising`
-  - SHORT: `close < EMA50` and `EMA50 falling`
+- Strict 1H directional filter (2 consecutive candles required):
+  - LONG: current and previous 1H candle both `close > EMA50`, `EMA50 rising`
+  - SHORT: current and previous 1H candle both `close < EMA50`, `EMA50 falling`
 - M15 trend alignment:
   - LONG: `EMA7 > EMA25` and `DIF > 0`
   - SHORT: `EMA7 < EMA25` and `DIF < 0`
@@ -52,8 +52,13 @@ Entry filters include:
   - current volume must be at least `1.3 * avg volume(5)` (strong confirmation required)
 - Anti-chop range filter:
   - reject if EMA7/EMA25 crossed `3` or more times over last `15` candles
+- Minimum impulse requirement:
+  - swing range (last 8 candles) must be at least `1.0 × ATR` — no entries on noise
+- Stop placement (capped at 2 ATR):
+  - LONG: `max(swing_low, price − 2×ATR)`
+  - SHORT: `min(swing_high, price + 2×ATR)`
 - Score-based ranking (minimum `3.0` to pass):
-  - `h1_slope_strength`: 1H EMA50 momentum (0–3 pts)
+  - `h1_slope_strength`: 1H EMA50 slope normalized by 1H ATR × 20 (0–3 pts)
   - `pullback_quality`: cleaner/smaller pullback body (0–2 pts)
   - `rr_vs_atr`: risk distance in ATR units (0–2 pts)
   - `volume_strength`: volume boost above average (0–1.5 pts)
