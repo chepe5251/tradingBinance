@@ -952,21 +952,6 @@ def main() -> None:
                             reason,
                         )
 
-                # Anti-liquidation guard before completing all scale stages.
-                _all_levels_done = (
-                    level_state["loss_l1_done"]
-                    and level_state["loss_l2_done"]
-                    and level_state["loss_l3_done"]
-                    and level_state["loss_l4_done"]
-                    and level_state["loss_l5_done"]
-                )
-                if not _all_levels_done and risk_ref > 0:
-                    adverse = (entry_ref - mark) if side == "BUY" else (mark - entry_ref)
-                    anti_liq_r = max(float(settings.anti_liq_trigger_r), 1.1)
-                    if adverse >= (anti_liq_r * risk_ref):
-                        return {"close_all": True, "reason": "anti_liq_guard", "exit_price": mark}
-                else:
-                    adverse = 0.0
 
                 if side == "BUY":
                     if mark <= sl_ref_price:
