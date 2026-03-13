@@ -282,7 +282,6 @@ def evaluate_signal(
         and pb_body_ratio <= 0.6
         and float(last["high"]) > prev1_high
         and price > prev1_close
-        and hist_expanding_long
     )
     short_impulse = (
         bias_short
@@ -295,7 +294,6 @@ def evaluate_signal(
         and pb_body_ratio <= 0.6
         and float(last["low"]) < prev1_low
         and price < prev1_close
-        and hist_expanding_short
     )
 
     breakout_ts = last.get("close_time")
@@ -319,11 +317,13 @@ def evaluate_signal(
         impulse_strength = min(2.0, impulse_leg / max(atr_val * 2.0, 1e-9))
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
+        hist_bonus = 0.5 if hist_expanding_long else 0.0
         score = (
             min(3.0, h1_slope_strength * 20.0)
             + min(2.0, pullback_quality * 6.0)
             + impulse_strength
             + min(1.5, max(0.0, volume_strength - 1.0))
+            + hist_bonus
             - min(2.0, late_penalty)
             - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
         )
@@ -363,11 +363,13 @@ def evaluate_signal(
         impulse_strength = min(2.0, impulse_leg / max(atr_val * 2.0, 1e-9))
         volume_strength = vol_last / max(vol_avg5, 1e-9)
         late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
+        hist_bonus = 0.5 if hist_expanding_short else 0.0
         score = (
             min(3.0, h1_slope_strength * 20.0)
             + min(2.0, pullback_quality * 6.0)
             + impulse_strength
             + min(1.5, max(0.0, volume_strength - 1.0))
+            + hist_bonus
             - min(2.0, late_penalty)
             - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
         )
