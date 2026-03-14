@@ -23,56 +23,54 @@ a time with automatic TP/SL protection.
 
 ---
 
-## Strategy: M15 Pullback Continuation with 1H Confirmation
+## Strategy: Liquidity Sweep Reversal (M15)
 
 ### Overview
 
-The strategy looks for **clean pullbacks inside an established trend**, entering
-on the first candle that breaks the pullback structure. Entries in
-over-extended or choppy conditions are rejected by multiple filters.
+The strategy detects **liquidity sweeps** — candles that break a key 20-bar
+high or low but close back inside the prior range, signalling that the
+breakout was absorbed by the market.  A second closed candle is required to
+confirm the reversal before any signal is emitted.
+
+This approach targets high-probability counter-moves after stop-hunts,
+entering after confirmation and placing the stop at the swept extreme.
 
 ### Signal Generation — LONG
 
-All conditions must be met in order. First failure = no signal.
+All conditions must pass in order. First failure = no signal.
 
 | # | Rule | Condition |
 |---|------|-----------|
-| 1 | **1H bias bullish** | Last 1H close `> EMA50` AND `EMA50 rising` (current > previous) |
-| 2 | **M15 trend aligned** | `EMA7 > EMA25` AND `DIF > 0` |
-| 3 | **Anti-range filter** | EMA7/EMA25 crossed `< 3` times in the last 15 candles |
-| 4 | **Pullback structure** | Candle −1 is red with `body/range ≤ 0.6`; low `≥ EMA25`; not 3 consecutive red candles |
-| 5 | **2-candle pullback** | If candles −1 and −2 are both red, candle −2 must also have `body/range ≤ 0.6` |
-| 6 | **Entry trigger** | Current high `> prev1 high` AND current close `> prev1 close` |
-| 7 | **MACD momentum** | Current MACD histogram `> previous bar` (expanding upward) |
-| 8 | **Volume confirmation** | Current volume `≥ 1.3 × avg(last 5 candles)` |
-| 9 | **Anti-late-entry** | Current range `< 1.6 × ATR`; distance from EMA7 `≤ 0.3 × ATR`; `body/range ≤ 0.85` |
-| 10 | **Impulse quality** | Pullback body `≤ 60%` of the 8-candle swing range |
-| 11 | **Risk validity** | `risk_per_unit ≥ 0.5 × ATR` |
+| 1 | **Trend bullish** | Sweep candle `close > EMA200` AND `EMA50 > EMA200` |
+| 2 | **Bearish sweep** | Sweep candle `low < lowest low of previous 20 candles` |
+| 3 | **False breakout** | Sweep candle `close > lowest_low_20` (price rejected the break) |
+| 4 | **Absorption wick** | `lower_wick / range ≥ 0.6` (strong buying tail) |
+| 5 | **Volume confirmation** | Sweep candle `volume ≥ 1.3 × avg volume (20)` |
+| 6 | **Size filter** | Sweep candle `range < 2 × ATR` |
+| 7 | **Reversal confirmation** | Next closed candle: `high > sweep high` AND `close > sweep close` |
+| 8 | **Risk validity** | `risk_per_unit ≥ 0.5 × ATR` |
 
-- **Stop loss:** swing low of last 8 candles
-- **Take profit:** `entry + risk × 1.8`
+- **Entry:** close of the confirmation candle
+- **Stop loss:** low of the sweep candle
+- **Take profit:** `entry + risk × 2.0`
 
 ### Signal Generation — SHORT
 
-Exact mirror of LONG logic:
-- 1H close `< EMA50`, `EMA50 falling`
-- `EMA7 < EMA25`, `DIF < 0`
-- Pullback: 1–2 green candles, `body/range ≤ 0.6`, high `≤ EMA25`
-- Entry trigger: current low `< prev1 low` AND close `< prev1 close`
-- MACD histogram `< previous bar` (expanding downward)
-- **Stop loss:** swing high of last 8 candles
+Exact mirror:
+- `close < EMA200` AND `EMA50 < EMA200`
+- Sweep candle `high > highest_high_20`, closes back below it
+- `upper_wick / range ≥ 0.6`
+- Confirmation candle: `low < sweep low` AND `close < sweep close`
+- **Stop loss:** high of the sweep candle
 
-### Score System (minimum 3.0 to emit signal)
+### Score System
 
 | Component | Formula | Max |
 |-----------|---------|-----|
-| 1H trend strength | `abs(EMA50_now − EMA50_prev) / EMA50_prev × 2500` | 3.0 |
-| Pullback quality | `(0.65 − pb_body_ratio) × 6` | 2.0 |
-| Risk vs ATR | `risk_per_unit / ATR` | 2.0 |
-| Volume strength | `(vol_current / vol_avg5) − 1.0` | 1.5 |
-| Late-entry penalty | `−((candle_range / ATR) − 1.0)` | −2.0 |
-| Volatility penalty | `−((ATR / ATR_avg20 − 1.3) × 3)` | −1.5 |
+| Wick quality | `(wick_ratio − 0.6) / 0.4 × 3` | 3.0 |
+| Volume boost | `vol / avg_vol − 1.3` | 2.0 |
 
+Signals with stronger absorption wicks and higher relative volume rank higher.
 When multiple symbols generate valid signals simultaneously, only the
 **highest-scoring** signal is executed.
 

@@ -1,9 +1,9 @@
-"""Signal engine for conservative M15 continuation entries.
+"""Liquidity Sweep Reversal signal engine for M15 futures trading.
 
-Design goals:
-- Reduce low-quality breakouts across a broad symbol universe.
-- Enforce strict 1H directional/trend-strength alignment.
-- Keep output schema stable for `main.py` and downstream execution code.
+Detects candles that sweep a key liquidity level (breaking a 20-bar high/low)
+but close back inside the prior range, signalling absorption and a likely
+reversal.  Confirmation is required from the next closed candle before any
+signal is emitted.
 """
 from __future__ import annotations
 
@@ -11,37 +11,24 @@ from typing import Optional
 
 import pandas as pd
 
-EMA_FAST = 7
-EMA_MID = 25
-EMA_BIAS_1H = 50
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-
-VOL_CONFIRM_WINDOW = 5
-RANGE_MAX_CROSSES = 3
-RANGE_CROSS_LOOKBACK = 15
-SWING_LOOKBACK = 8
-MIN_RR_TARGET = 1.8
+EMA_TREND_FAST = 50
+EMA_TREND_SLOW = 200
+SWEEP_LOOKBACK = 20
+VOL_LOOKBACK = 20
+MIN_WICK_RATIO = 0.6
+VOL_MULT = 1.3
+MAX_RANGE_ATR = 2.0
+MIN_RISK_ATR = 0.5
+RR_TARGET = 2.0
 
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
-    """Compute exponential moving average for a price series."""
+    """Exponential moving average."""
     return series.ewm(span=period, adjust=False).mean()
 
 
-def _macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Return MACD tuple: DIF, DEA (signal), and histogram."""
-    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
-    dif = ema_fast - ema_slow
-    dea = dif.ewm(span=MACD_SIGNAL, adjust=False).mean()
-    hist = dif - dea
-    return dif, dea, hist
-
-
 def _atr(df: pd.DataFrame, period: int) -> pd.Series:
-    """Compute ATR using an EWMA of true range."""
+    """ATR using EWMA of true range."""
     high = df["high"]
     low = df["low"]
     close = df["close"]
@@ -55,17 +42,6 @@ def _atr(df: pd.DataFrame, period: int) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
-
-
-def _is_flat_range(ema_fast: pd.Series, ema_mid: pd.Series) -> bool:
-    """Detect frequent EMA crossover behavior often associated with ranges."""
-    if len(ema_fast) < RANGE_CROSS_LOOKBACK or len(ema_mid) < RANGE_CROSS_LOOKBACK:
-        return True
-    diff = (ema_fast - ema_mid).iloc[-RANGE_CROSS_LOOKBACK:]
-    sign = diff > 0
-    crosses = int((sign != sign.shift(1)).dropna().sum())
-    return crosses >= RANGE_MAX_CROSSES
-
 
 
 def evaluate_signal(
@@ -84,303 +60,150 @@ def evaluate_signal(
     rsi_short_max: float,
     volume_min_ratio: float,
 ) -> Optional[dict]:
-    """Evaluate one symbol and return a normalized signal payload.
+    """Evaluate one symbol for a Liquidity Sweep Reversal entry.
 
-    Current ruleset:
-    - Strict 1H directional filter (price vs EMA50 + EMA50 slope).
-    - M15 trend alignment with early pullback-entry trigger.
-    - Anti-range, anti-late-entry, and volume confirmation filters.
-
-    Parameters are kept to preserve the shared strategy interface used by
-    `main.py`, even when some knobs are not used by this implementation.
+    Requires at least 230 M15 candles so EMA200 is meaningful.
+    Parameters beyond `atr_period` are accepted but unused — they keep the
+    shared interface with `main.py` intact.
     """
-    del ema_trend, ema_fast, ema_mid, atr_avg_window, rsi_period
-    del rsi_long_min, rsi_long_max, rsi_short_min, rsi_short_max, volume_min_ratio
-    del volume_avg_window
+    del (
+        ema_trend, ema_fast, ema_mid, atr_avg_window, volume_avg_window,
+        rsi_period, rsi_long_min, rsi_long_max, rsi_short_min, rsi_short_max,
+        volume_min_ratio, context_df,
+    )
 
-    if main_df.empty or context_df.empty:
-        return None
-    if len(main_df) < 70 or len(context_df) < 70:
+    if main_df.empty or len(main_df) < 230:
         return None
 
     m15 = main_df.copy()
-    h1 = context_df.copy()
 
-    m15["ema7"] = _ema(m15["close"], EMA_FAST)
-    m15["ema25"] = _ema(m15["close"], EMA_MID)
+    m15["ema50"] = _ema(m15["close"], EMA_TREND_FAST)
+    m15["ema200"] = _ema(m15["close"], EMA_TREND_SLOW)
     m15["atr"] = _atr(m15, atr_period)
-    m15["vol_avg5_prev"] = m15["volume"].rolling(window=VOL_CONFIRM_WINDOW).mean().shift(1)
+    m15["avg_vol20"] = m15["volume"].rolling(VOL_LOOKBACK).mean()
+    # Reference levels are shifted so the sweep candle itself is excluded.
+    m15["highest_high_20"] = m15["high"].rolling(SWEEP_LOOKBACK).max().shift(1)
+    m15["lowest_low_20"] = m15["low"].rolling(SWEEP_LOOKBACK).min().shift(1)
 
-    dif, dea, hist = _macd(m15["close"])
-    m15["dif"] = dif
-    m15["dea"] = dea
-    m15["hist"] = hist
-
-    h1["ema50"] = _ema(h1["close"], EMA_BIAS_1H)
-
-    last = m15.iloc[-1]
-    prev1 = m15.iloc[-2]
-    prev2 = m15.iloc[-3]
-    prev3 = m15.iloc[-4]
-    h1_last = h1.iloc[-1]
-    h1_prev = h1.iloc[-2]
+    sweep = m15.iloc[-2]    # candle that swept the level
+    confirm = m15.iloc[-1]  # candle that confirms the reversal (just closed)
 
     required = [
-        last["ema7"],
-        last["ema25"],
-        last["dif"],
-        last["vol_avg5_prev"],
-        last["atr"],
-        last["open"],
-        last["high"],
-        last["low"],
-        prev1["high"],
-        prev1["low"],
-        prev1["open"],
-        prev1["close"],
-        prev1["volume"],
-        prev1["ema25"],
-        prev2["volume"],
-        prev2["open"],
-        prev2["close"],
-        prev2["high"],
-        prev2["low"],
-        last["hist"],
-        prev1["hist"],
-        prev3["open"],
-        prev3["close"],
-        last["close"],
-        last["volume"],
-        h1_last["close"],
-        h1_last["ema50"],
-        h1_prev["ema50"],
+        sweep["ema50"], sweep["ema200"], sweep["atr"],
+        sweep["avg_vol20"], sweep["highest_high_20"], sweep["lowest_low_20"],
+        sweep["high"], sweep["low"], sweep["open"], sweep["close"], sweep["volume"],
+        confirm["high"], confirm["low"], confirm["close"],
     ]
     if any(pd.isna(v) for v in required):
         return None
 
-    price = float(last["close"])
-    if price <= 0:
+    ema50 = float(sweep["ema50"])
+    ema200 = float(sweep["ema200"])
+    atr_val = float(sweep["atr"])
+    avg_vol = float(sweep["avg_vol20"])
+    highest_20 = float(sweep["highest_high_20"])
+    lowest_20 = float(sweep["lowest_low_20"])
+
+    s_high = float(sweep["high"])
+    s_low = float(sweep["low"])
+    s_open = float(sweep["open"])
+    s_close = float(sweep["close"])
+    s_vol = float(sweep["volume"])
+
+    c_high = float(confirm["high"])
+    c_low = float(confirm["low"])
+    c_close = float(confirm["close"])
+
+    if atr_val <= 0 or avg_vol <= 0:
         return None
 
-    # Strong range filter to suppress choppy regimes.
-    if _is_flat_range(m15["ema7"], m15["ema25"]):
+    sweep_range = s_high - s_low
+    if sweep_range <= 0:
         return None
 
-    # Strict 1H filter.
-    h1_close = float(h1_last["close"])
-    h1_ema_last = float(h1_last["ema50"])
-    h1_ema_prev = float(h1_prev["ema50"])
-    bias_long = (
-        h1_close > h1_ema_last
-        and h1_ema_last > h1_ema_prev
-    )
-    bias_short = (
-        h1_close < h1_ema_last
-        and h1_ema_last < h1_ema_prev
-    )
-    if not (bias_long or bias_short):
-        return None
+    entry_price = c_close
 
-    atr_val = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
-    atr_avg = float(m15["atr"].rolling(window=20).mean().iloc[-1]) if len(m15) >= 25 else 0.0
-    if atr_val <= 0 or atr_avg <= 0:
-        return None
-
-    # Block late entries.
-    candle_range = float(last["high"] - last["low"])
-    if candle_range <= 0:
-        return None
-    if candle_range > (1.6 * atr_val):
-        return None
-
-    ema7_last = float(last["ema7"])
-    ema25_last = float(last["ema25"])
-    if abs(price - ema7_last) > atr_val * 0.3:
-        return None
-
-    body = abs(float(last["close"] - last["open"]))
-    body_ratio = body / candle_range if candle_range > 0 else 0.0
-    if body_ratio > 0.85:
-        return None
-
-    # Volume filter.
-    vol_avg5_raw = last["vol_avg5_prev"]
-    vol_avg5 = float(vol_avg5_raw) if not pd.isna(vol_avg5_raw) else 0.0
-    vol_last = float(last["volume"])
-    vol_confirm_ok = vol_avg5 > 0 and vol_last >= (vol_avg5 * 1.3)
-    if not vol_confirm_ok:
-        return None
-
-    prev1_open = float(prev1["open"])
-    prev1_close = float(prev1["close"])
-    prev1_high = float(prev1["high"])
-    prev1_low = float(prev1["low"])
-    prev1_ema25 = float(prev1["ema25"])
-
-    prev2_open = float(prev2["open"])
-    prev2_close = float(prev2["close"])
-    prev2_high = float(prev2["high"])
-    prev2_low = float(prev2["low"])
-    prev3_open = float(prev3["open"])
-    prev3_close = float(prev3["close"])
-
-    swing_w = m15.iloc[-(SWING_LOOKBACK + 1):-1]
-    swing_low = float(swing_w["low"].min()) if not swing_w.empty else float(prev1["low"])
-    swing_high = float(swing_w["high"].max()) if not swing_w.empty else float(prev1["high"])
-    impulse_leg = swing_high - swing_low
-
-    dif_last = float(last["dif"])
-
-    # Pullback structure: allow 1-2 opposite candles, no more.
-    red1 = prev1_close < prev1_open
-    red2 = prev2_close < prev2_open
-    red3 = prev3_close < prev3_open
-    green1 = prev1_close > prev1_open
-    green2 = prev2_close > prev2_open
-    green3 = prev3_close > prev3_open
-
-    pb_range = float(prev1_high - prev1_low)
-    pb_body = abs(float(prev1_close - prev1_open))
-    pb_body_ratio = (pb_body / pb_range) if pb_range > 0 else 1.0
-
-    # 2-candle pullback: validate second candle body ratio as well.
-    if red1 and red2:
-        pb2_range = abs(prev2_high - prev2_low)
-        pb2_body = abs(prev2_close - prev2_open)
-        pb2_body_ratio = pb2_body / pb2_range if pb2_range > 0 else 1.0
-        if pb2_body_ratio > 0.6:
-            return None
-    if green1 and green2:
-        pb2_range = abs(prev2_high - prev2_low)
-        pb2_body = abs(prev2_close - prev2_open)
-        pb2_body_ratio = pb2_body / pb2_range if pb2_range > 0 else 1.0
-        if pb2_body_ratio > 0.6:
-            return None
-
-    # MACD histogram expanding in the direction of the trade.
-    hist_expanding_long = float(last["hist"]) > float(prev1["hist"])
-    hist_expanding_short = float(last["hist"]) < float(prev1["hist"])
-
-    # Early trigger: break pullback candle high/low, no giant breakout required.
-    long_impulse = (
-        bias_long
-        and
-        ema7_last > ema25_last
-        and dif_last > 0
-        and red1
-        and not (red1 and red2 and red3)
-        and prev1_low >= prev1_ema25
-        and pb_body_ratio <= 0.6
-        and float(last["high"]) > prev1_high
-        and price > prev1_close
-        and hist_expanding_long
-    )
-    short_impulse = (
-        bias_short
-        and
-        ema7_last < ema25_last
-        and dif_last < 0
-        and green1
-        and not (green1 and green2 and green3)
-        and prev1_high <= prev1_ema25
-        and pb_body_ratio <= 0.6
-        and float(last["low"]) < prev1_low
-        and price < prev1_close
-        and hist_expanding_short
+    ts = confirm.get("close_time")
+    timestamp = (
+        ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+        if isinstance(ts, pd.Timestamp)
+        else str(ts)
     )
 
-    breakout_ts = last.get("close_time")
-    if isinstance(breakout_ts, pd.Timestamp):
-        breakout_time = breakout_ts.strftime("%Y-%m-%d %H:%M:%S UTC")
-    else:
-        breakout_time = str(breakout_ts)
+    # ── LONG ──────────────────────────────────────────────────────────────────
+    if s_close > ema200 and ema50 > ema200:               # 1. trend bullish
+        if s_low < lowest_20:                              # 2. bearish sweep
+            if s_close > lowest_20:                        # 3. false breakout
+                lower_wick = min(s_open, s_close) - s_low
+                wick_ratio = lower_wick / sweep_range
+                if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
+                    if s_vol >= VOL_MULT * avg_vol:        # 5. volume
+                        if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
+                            if c_high > s_high and c_close > s_close:  # 7. confirm
+                                stop_price = s_low
+                                risk = entry_price - stop_price
+                                if risk >= MIN_RISK_ATR * atr_val and risk > 0:
+                                    tp_price = entry_price + risk * RR_TARGET
+                                    score = round(
+                                        min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
+                                        + min(2.0, (s_vol / avg_vol - VOL_MULT)),
+                                        2,
+                                    )
+                                    return {
+                                        "side": "BUY",
+                                        "price": entry_price,
+                                        "stop_price": stop_price,
+                                        "tp_price": tp_price,
+                                        "risk_per_unit": risk,
+                                        "rr_target": RR_TARGET,
+                                        "atr": atr_val,
+                                        "score": score,
+                                        "strategy": "liquidity_sweep_reversal",
+                                        "confirm_m15": (
+                                            f"Sweep below {lowest_20:.4f} | "
+                                            f"wick={wick_ratio:.2f} | "
+                                            f"vol={s_vol/avg_vol:.1f}x | "
+                                            f"confirm close={c_close:.4f}"
+                                        ),
+                                        "breakout_time": timestamp,
+                                    }
 
-    if long_impulse:
-        if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
-            return None
-        stop_price = swing_low
-        risk_per_unit = price - stop_price
-        if risk_per_unit <= 0:
-            return None
-        if risk_per_unit < atr_val * 0.5:
-            return None
-        h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
-        pullback_quality = max(0.0, 0.65 - pb_body_ratio)
-        rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
-        volume_strength = vol_last / max(vol_avg5, 1e-9)
-        late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
-        score = (
-            min(3.0, h1_slope_strength * 2500.0)
-            + min(2.0, pullback_quality * 6.0)
-            + min(2.0, rr_vs_atr)
-            + min(1.5, max(0.0, volume_strength - 1.0))
-            - min(2.0, late_penalty)
-            - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
-        )
-        score = round(max(0.0, score), 2)
-        if score < 3.0:
-            return None
-        return {
-            "side": "BUY",
-            "price": price,
-            "atr": atr_val,
-            "atr_avg": atr_avg,
-            "risk_per_unit": risk_per_unit,
-            "rr_target": MIN_RR_TARGET,
-            "stop_price": stop_price,
-            "tp_price": price + (risk_per_unit * MIN_RR_TARGET),
-            "estructura_valida": True,
-            "retroceso_valido": True,
-            "volumen_confirmado": True,
-            "structure_ok": True,
-            "volume_ok": True,
-            "confirm_m15": "EMA7>EMA25 + close>EMA7 + DIF>0 + cierre sobre maximo previo",
-            "breakout_time": breakout_time,
-            "score": score,
-        }
-
-    if short_impulse:
-        if abs(prev1_close - prev1_open) > impulse_leg * 0.60:
-            return None
-        stop_price = swing_high
-        risk_per_unit = stop_price - price
-        if risk_per_unit <= 0:
-            return None
-        if risk_per_unit < atr_val * 0.5:
-            return None
-        h1_slope_strength = abs(h1_ema_last - h1_ema_prev) / max(abs(h1_ema_prev), 1e-9)
-        pullback_quality = max(0.0, 0.65 - pb_body_ratio)
-        rr_vs_atr = risk_per_unit / max(atr_val, 1e-9)
-        volume_strength = vol_last / max(vol_avg5, 1e-9)
-        late_penalty = max(0.0, (candle_range / atr_val) - 1.0)
-        score = (
-            min(3.0, h1_slope_strength * 2500.0)
-            + min(2.0, pullback_quality * 6.0)
-            + min(2.0, rr_vs_atr)
-            + min(1.5, max(0.0, volume_strength - 1.0))
-            - min(2.0, late_penalty)
-            - min(1.5, max(0.0, (atr_val / atr_avg - 1.3) * 3.0))
-        )
-        score = round(max(0.0, score), 2)
-        if score < 3.0:
-            return None
-        return {
-            "side": "SELL",
-            "price": price,
-            "atr": atr_val,
-            "atr_avg": atr_avg,
-            "risk_per_unit": risk_per_unit,
-            "rr_target": MIN_RR_TARGET,
-            "stop_price": stop_price,
-            "tp_price": price - (risk_per_unit * MIN_RR_TARGET),
-            "estructura_valida": True,
-            "retroceso_valido": True,
-            "volumen_confirmado": True,
-            "structure_ok": True,
-            "volume_ok": True,
-            "confirm_m15": "EMA7<EMA25 + close<EMA7 + DIF<0 + cierre bajo minimo previo",
-            "breakout_time": breakout_time,
-            "score": score,
-        }
+    # ── SHORT ─────────────────────────────────────────────────────────────────
+    if s_close < ema200 and ema50 < ema200:               # 1. trend bearish
+        if s_high > highest_20:                            # 2. bullish sweep
+            if s_close < highest_20:                       # 3. false breakout
+                upper_wick = s_high - max(s_open, s_close)
+                wick_ratio = upper_wick / sweep_range
+                if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
+                    if s_vol >= VOL_MULT * avg_vol:        # 5. volume
+                        if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
+                            if c_low < s_low and c_close < s_close:  # 7. confirm
+                                stop_price = s_high
+                                risk = stop_price - entry_price
+                                if risk >= MIN_RISK_ATR * atr_val and risk > 0:
+                                    tp_price = entry_price - risk * RR_TARGET
+                                    score = round(
+                                        min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
+                                        + min(2.0, (s_vol / avg_vol - VOL_MULT)),
+                                        2,
+                                    )
+                                    return {
+                                        "side": "SELL",
+                                        "price": entry_price,
+                                        "stop_price": stop_price,
+                                        "tp_price": tp_price,
+                                        "risk_per_unit": risk,
+                                        "rr_target": RR_TARGET,
+                                        "atr": atr_val,
+                                        "score": score,
+                                        "strategy": "liquidity_sweep_reversal",
+                                        "confirm_m15": (
+                                            f"Sweep above {highest_20:.4f} | "
+                                            f"wick={wick_ratio:.2f} | "
+                                            f"vol={s_vol/avg_vol:.1f}x | "
+                                            f"confirm close={c_close:.4f}"
+                                        ),
+                                        "breakout_time": timestamp,
+                                    }
 
     return None
