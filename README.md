@@ -1,91 +1,128 @@
 # Binance Futures Scalping Bot (USDT-M)
 
-Algorithmic trading bot for **Binance USDT-M Futures** with:
-- full-universe multi-pair scanning (all available USDT-M perpetual symbols),
-- Telegram signal broadcasting,
-- automatic execution with only 1 active trade at a time,
-- TP/SL protection and continuous monitoring.
+Algorithmic trading bot for **Binance USDT-M Futures** that scans the full
+perpetual universe, broadcasts signals via Telegram, and executes one trade at
+a time with automatic TP/SL protection.
 
-## Important Notice
-This software can open and close real positions. Use it at your own risk. Start in **testnet** or **paper mode** first.
+> **Warning:** This software opens and closes real positions. Start in
+> `testnet` or `paper` mode before deploying real capital.
+
+---
 
 ## Core Features
-- Full USDT perpetual symbol universe scanning (no hard symbol cap by default).
-- Signal strategy on `M15` with strict `1H` trend-strength alignment.
-- Sends **all** valid signals to Telegram.
-- Executes only the first valid signal when:
-  - `RiskManager` allows trading, and
-  - no open position exists.
-- Limit entry with market fallback.
-- Mandatory TP/SL with automatic recovery if protection orders are lost.
-- Floating-loss scaling (levels defined in current logic).
-- Telegram anti-spam protection with rate-limit handling (`HTTP 429` retry).
-- WebSocket heartbeat and automatic restart.
 
-## Strategy Profile (Current)
-The strategy is selective and continuation-focused, designed for earlier entries
-near the end of pullbacks (not late expansion candles).
+- Full USDT-M perpetual symbol universe (529+ pairs by default).
+- Signal engine on **M15** with strict **1H** trend alignment.
+- All valid signals broadcast to Telegram.
+- Executes only the **top-scored** signal when `RiskManager` allows and no open position exists.
+- Limit entry with automatic market fallback on timeout.
+- Mandatory TP/SL with recovery logic if protection orders disappear.
+- Loss-based scaling: up to **5 scale-in levels** on an adverse move.
+- Telegram rate-limit handling (`HTTP 429` retry).
+- WebSocket multiplexer with stale-detection and automatic restart.
 
-Entry filters include:
-- Strict 1H directional filter (2 consecutive candles required):
-  - LONG: current and previous 1H candle both `close > EMA50`, `EMA50 rising`
-  - SHORT: current and previous 1H candle both `close < EMA50`, `EMA50 falling`
-- M15 trend alignment:
-  - LONG: `EMA7 > EMA25` and `DIF > 0`
-  - SHORT: `EMA7 < EMA25` and `DIF < 0`
-- MACD histogram expanding in trade direction:
-  - LONG: current histogram bar `> previous histogram bar`
-  - SHORT: current histogram bar `< previous histogram bar`
-- Structured small pullback requirement:
-  - only `1` or `2` opposite candles allowed
-  - **all** pullback candles must have `body/range <= 0.6` (both candles validated for 2-candle pullbacks)
-  - LONG pullback low must hold above EMA25
-  - SHORT pullback high must hold below EMA25
-- Early entry trigger:
-  - LONG: current candle breaks pullback high and closes above pullback close
-  - SHORT: current candle breaks pullback low and closes below pullback close
-- Late-entry blockers:
-  - reject if current range `> 1.6 * ATR`
-  - reject if distance from EMA7 `> 0.3 * ATR`
-  - reject if current `body/range > 0.85`
-- Volume quality gate:
-  - current volume must be at least `1.3 * avg volume(5)` (strong confirmation required)
-- Anti-chop range filter:
-  - reject if EMA7/EMA25 crossed `3` or more times over last `15` candles
-- Minimum impulse requirement:
-  - swing range (last 8 candles) must be at least `1.0 × ATR` — no entries on noise
-- Stop placement (capped at 2 ATR):
-  - LONG: `max(swing_low, price − 2×ATR)`
-  - SHORT: `min(swing_high, price + 2×ATR)`
-- Score-based ranking (minimum `3.0` to pass):
-  - `h1_slope_strength`: 1H EMA50 slope normalized by 1H ATR × 20 (0–3 pts)
-  - `pullback_quality`: cleaner/smaller pullback body (0–2 pts)
-  - `rr_vs_atr`: risk distance in ATR units (0–2 pts)
-  - `volume_strength`: volume boost above average (0–1.5 pts)
-  - `late_penalty`: penalizes large entry candles (up to −2 pts)
-  - `atr_regime_penalty`: penalizes high-volatility regimes where ATR > 1.3× its 20-bar average (up to −1.5 pts)
-  - the engine sorts signals and executes only the top score each cycle
+---
+
+## Strategy: M15 Pullback Continuation with 1H Confirmation
+
+### Overview
+
+The strategy looks for **clean pullbacks inside an established trend**, entering
+on the first candle that breaks the pullback structure. Entries in
+over-extended or choppy conditions are rejected by multiple filters.
+
+### Signal Generation — LONG
+
+All conditions must be met in order. First failure = no signal.
+
+| # | Rule | Condition |
+|---|------|-----------|
+| 1 | **1H bias bullish** | Last 1H close `> EMA50` AND `EMA50 rising` (current > previous) |
+| 2 | **M15 trend aligned** | `EMA7 > EMA25` AND `DIF > 0` |
+| 3 | **Anti-range filter** | EMA7/EMA25 crossed `< 3` times in the last 15 candles |
+| 4 | **Pullback structure** | Candle −1 is red with `body/range ≤ 0.6`; low `≥ EMA25`; not 3 consecutive red candles |
+| 5 | **2-candle pullback** | If candles −1 and −2 are both red, candle −2 must also have `body/range ≤ 0.6` |
+| 6 | **Entry trigger** | Current high `> prev1 high` AND current close `> prev1 close` |
+| 7 | **MACD momentum** | Current MACD histogram `> previous bar` (expanding upward) |
+| 8 | **Volume confirmation** | Current volume `≥ 1.3 × avg(last 5 candles)` |
+| 9 | **Anti-late-entry** | Current range `< 1.6 × ATR`; distance from EMA7 `≤ 0.3 × ATR`; `body/range ≤ 0.85` |
+| 10 | **Impulse quality** | Pullback body `≤ 60%` of the 8-candle swing range |
+| 11 | **Risk validity** | `risk_per_unit ≥ 0.5 × ATR` |
+
+- **Stop loss:** swing low of last 8 candles
+- **Take profit:** `entry + risk × 1.8`
+
+### Signal Generation — SHORT
+
+Exact mirror of LONG logic:
+- 1H close `< EMA50`, `EMA50 falling`
+- `EMA7 < EMA25`, `DIF < 0`
+- Pullback: 1–2 green candles, `body/range ≤ 0.6`, high `≤ EMA25`
+- Entry trigger: current low `< prev1 low` AND close `< prev1 close`
+- MACD histogram `< previous bar` (expanding downward)
+- **Stop loss:** swing high of last 8 candles
+
+### Score System (minimum 3.0 to emit signal)
+
+| Component | Formula | Max |
+|-----------|---------|-----|
+| 1H trend strength | `abs(EMA50_now − EMA50_prev) / EMA50_prev × 2500` | 3.0 |
+| Pullback quality | `(0.65 − pb_body_ratio) × 6` | 2.0 |
+| Risk vs ATR | `risk_per_unit / ATR` | 2.0 |
+| Volume strength | `(vol_current / vol_avg5) − 1.0` | 1.5 |
+| Late-entry penalty | `−((candle_range / ATR) − 1.0)` | −2.0 |
+| Volatility penalty | `−((ATR / ATR_avg20 − 1.3) × 3)` | −1.5 |
+
+When multiple symbols generate valid signals simultaneously, only the
+**highest-scoring** signal is executed.
+
+---
+
+## Loss-Based Scaling
+
+After the initial entry, the bot can scale in up to **5 additional levels** when
+the position moves against you, lowering the average entry price:
+
+| Level | Trigger (loss on margin) | Additional margin |
+|-------|--------------------------|------------------|
+| 1 | −50% | $5 |
+| 2 | −100% | $10 |
+| 3 | −200% | $20 |
+| 4 | −400% | $40 |
+| 5 | −800% | $80 |
+
+Scale levels are configured via `SCALE_LEVEL*_MARGIN_USDT` env vars. Set to
+`0` to disable a level.
+
+---
 
 ## Architecture
-- `main.py`: orchestration (stream, signals, execution, monitoring).
-- `strategy.py`: signal engine.
-- `execution.py`: order execution, Binance filter rounding, TP/SL, OCO monitor.
-- `data_stream.py`: historical load + WebSocket + candle cache.
-- `risk.py`: cooldown, daily drawdown guard, loss pause logic.
-- `config.py`: `Settings` model and `.env` loading.
-- `indicators.py`: indicator helpers (used by auxiliary flows if needed).
-- `test_trade.py`: manual script to validate minimal order placement.
+
+| File | Responsibility |
+|------|---------------|
+| `main.py` | Orchestration: stream, signals, execution, monitoring |
+| `strategy.py` | Signal engine (filters, scoring, TP/SL calculation) |
+| `execution.py` | Order placement, Binance filter rounding, TP/SL, OCO monitor |
+| `data_stream.py` | Historical candle load + WebSocket multiplexer + cache |
+| `risk.py` | Cooldown, daily drawdown guard, consecutive-loss pause |
+| `config.py` | `Settings` dataclass and `.env` loader |
+| `test_trade.py` | Manual script to validate minimal order placement |
+
+---
 
 ## Requirements
+
 - Python 3.10+
 - Binance Futures account (testnet or live)
-- Dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
+---
+
 ## Configuration
+
 Create a `.env` file in the project root:
 
 ```env
@@ -104,58 +141,64 @@ TELEGRAM_CHAT_ID=123456789
 USE_PAPER_TRADING=false
 PAPER_START_BALANCE=25
 
-# Optional: risk controls
+# Risk controls
 FIXED_MARGIN_PER_TRADE_USDT=5
 DAILY_DRAWDOWN_LIMIT_USDT=6
-ANTI_LIQ_TRIGGER_R=1.1
+
+# Scaling levels (set to 0 to disable)
+SCALE_LEVEL1_MARGIN_USDT=5
+SCALE_LEVEL2_MARGIN_USDT=0
 ```
 
-## Key Parameters (`config.py`)
-Most relevant runtime settings:
+### Key Parameters (`config.py`)
 
-- `main_interval` (default `15m`)
-- `context_interval` (default `1h`)
-- `leverage` (default `20`)
-- `fixed_margin_per_trade_usdt` (default `5.0`)
-- `tp_rr` (default `1.8`)
-- `stop_atr_mult` (default `1.2`)
-- `cooldown_sec` (default `180`)
-- `max_consecutive_losses` (default `2`)
-- `daily_drawdown_limit_usdt` (default `6.0`)
-- `history_candles_main` / `history_candles_context`
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `main_interval` | `15m` | Signal timeframe |
+| `context_interval` | `1h` | Trend-bias timeframe |
+| `leverage` | `20` | Futures leverage |
+| `fixed_margin_per_trade_usdt` | `5.0` | Margin per entry |
+| `tp_rr` | `1.8` | Risk/reward ratio |
+| `cooldown_sec` | `180` | Seconds between entries |
+| `max_consecutive_losses` | `2` | Losses before pause |
+| `daily_drawdown_limit_usdt` | `6.0` | Max daily loss (USD) |
+| `risk_pause_after_losses_sec` | `3600` | Pause duration after loss limit |
+
+---
 
 ## Run
+
 ```bash
 python main.py
 ```
 
-## Operational Flow (Summary)
-1. Load configuration and historical candles.
-2. Start WebSocket multiplexer in chunks.
-3. On each main candle close:
-   - evaluate signals across all symbols,
-   - send valid signals to Telegram,
-   - execute only one signal if allowed.
+---
+
+## Operational Flow
+
+1. Load config and historical candles for all symbols.
+2. Start WebSocket multiplexer in chunks of 50 streams.
+3. On each M15 candle close:
+   - Evaluate strategy across all symbols in parallel.
+   - Broadcast all valid signals to Telegram.
+   - Execute the highest-scored signal if `RiskManager` allows.
 4. After execution:
-   - place TP/SL,
-   - start a protection/monitoring thread,
-   - apply exit/scale rules based on runtime state.
+   - Place TP/SL orders.
+   - Start monitoring thread.
+   - Apply exit / scale-in rules based on runtime state.
+
+---
 
 ## Logs
-- Console: status, heartbeat, warnings, and errors.
-- File: `logs/trades.log` (validation, entry, exit, and monitor events).
+
+- **Console:** heartbeat, warnings, errors.
+- **File:** `logs/trades.log` — entry, exit, scale, and monitor events.
+
+---
 
 ## Recommended Practices
-- Start with `BINANCE_TESTNET=true`.
-- Use `USE_PAPER_TRADING=true` to validate logic with no market risk.
+
+- Always start with `BINANCE_TESTNET=true`.
+- Validate with `USE_PAPER_TRADING=true` before live deployment.
 - Never commit your `.env` file.
-- Review `logs/trades.log` before tuning parameters.
-
-## GitHub Workflow
-Standard push flow:
-
-```bash
-git add .
-git commit -m "update readme"
-git push
-```
+- Review `logs/trades.log` before tuning any parameter.
