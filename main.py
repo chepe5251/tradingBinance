@@ -46,12 +46,19 @@ def _get_available_balance(client: Client) -> float:
 
 
 def _has_any_position(client: Client) -> bool:
-    """Return whether any futures symbol currently has a non-zero position."""
+    """Return whether any futures symbol has an open position or a pending entry order."""
     positions = client.futures_position_information()
     for p in positions:
         amt = float(p.get("positionAmt", 0))
         if abs(amt) > 0:
             return True
+    # Also block if there are any open orders (covers unfilled limit entries).
+    try:
+        open_orders = client.futures_get_open_orders()
+        if open_orders:
+            return True
+    except Exception:
+        pass
     return False
 
 
