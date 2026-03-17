@@ -151,6 +151,8 @@ tradingPython/
 
 ## Installation
 
+> For detailed per-OS instructions (Windows, macOS, Linux, systemd service, tmux, Task Scheduler) see [INSTALL.md](INSTALL.md).
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/chepe5251/tradingBinance.git
@@ -167,7 +169,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 4. Copy the configuration template
-cp .env.example .env
+cp .env.example .env   # then edit .env with your credentials
 ```
 
 ---
