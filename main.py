@@ -317,6 +317,7 @@ def _macd_ok(df, side: str) -> bool:
 def _layered_signal_check(
     signal: dict | None,
     df,
+    ctx,
     side: str | None,
     ctx_dir: str | None,
     trend_clear: bool,
@@ -361,7 +362,7 @@ def _layered_signal_check(
     if not layer_3_ok:
         return False, "sobreextension_o_fomo"
 
-    # CAPA 4: momentum real (veto obligatorio)
+    # CAPA 4: momentum M15 (veto obligatorio)
     volumen_confirmado = bool(signal.get("volumen_confirmado") or signal.get("volume_ok"))
     if side == "BUY":
         rsi_ok = 40.0 <= rsi_last <= 70.0
@@ -371,6 +372,11 @@ def _layered_signal_check(
     layer_4_ok = volume_ok and volumen_confirmado and rsi_ok and macd_ok
     if not layer_4_ok:
         return False, "momentum_insuficiente"
+
+    # CAPA 5: MACD 1H alineado — evita entrar contra el momentum HTF (veto obligatorio)
+    if ctx is not None and not ctx.empty and len(ctx) >= 35:
+        if not _macd_ok(ctx, side):
+            return False, "macd_htf_desalineado"
 
     return True, "ok"
 
@@ -384,6 +390,7 @@ def _fmt_validation_reason(reason: str) -> str:
         "atr_o_precio_invalido": "ATR o precio invalido",
         "sobreextension_o_fomo": "Precio sobreextendido o vela FOMO",
         "momentum_insuficiente": "Momentum sin confirmacion",
+        "macd_htf_desalineado": "MACD 1H contra la direccion del trade",
         "sin_senal": "No hay setup operativo",
     }
     return mapping.get(reason, reason)
@@ -608,6 +615,30 @@ def main() -> None:
                 continue
 
             side = signal.get("side") or "NONE"
+
+            atr_val_check = float(signal.get("atr") or 0.0) or _calc_atr(df, settings.atr_period)
+            rsi_last_check = _calc_rsi(df, settings.rsi_period)
+            ctx_dir_check = _context_direction(ctx, settings.ema_trend)
+            ctx_slope_check = _context_slope(ctx, settings.ema_trend)
+            trend_clear_check = abs(ctx_slope_check) >= settings.trend_slope_min
+            volume_ok_check = bool(signal.get("volume_ok") or signal.get("volumen_confirmado"))
+
+            passed, reject_reason = _layered_signal_check(
+                signal,
+                df,
+                ctx,
+                side,
+                ctx_dir_check,
+                trend_clear_check,
+                settings.ema_fast,
+                atr_val_check,
+                volume_ok_check,
+                rsi_last_check,
+            )
+            if not passed:
+                trades_logger.info("filter %s side=%s reason=%s", sym, side, reject_reason)
+                continue
+
             trades_logger.info(
                 "signal %s side=%s m15=%s breakout=%s",
                 sym,

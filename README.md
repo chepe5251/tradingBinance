@@ -81,6 +81,28 @@ SL     = low/high of sweep candle
 TP     = entry ± (risk × 2.0)
 ```
 
+#### Validation Layers (applied after signal detection)
+
+Every signal from `evaluate_signal()` must pass 5 additional hard filters before it is considered valid. All 5 must pass — any failure discards the signal silently (logged to `trades.log` with the reject reason).
+
+| Layer | Filter | Condition |
+|-------|--------|-----------|
+| 1 | **HTF context aligned** | 1H `close > EMA200` AND EMA slope ≥ threshold (LONG) |
+| 2 | **Clean structure** | `estructura_valida` AND `retroceso_valido` both true |
+| 3 | **No overextension / FOMO** | Price within `1.8 × ATR` of fast EMA AND candle body `≤ 2 × ATR` |
+| 4 | **M15 momentum** | Volume confirmed + RSI in range + MACD M15 aligned |
+| 5 | **1H MACD aligned** | MACD line > Signal line AND histogram > 0 on 1H (LONG) |
+
+Reject codes logged in `trades.log`:
+
+| Code | Meaning |
+|------|---------|
+| `contexto_htf_desalineado` | 1H trend direction against the trade |
+| `estructura_no_valida` | Pullback structure not clean |
+| `sobreextension_o_fomo` | Price too far from EMA or candle too large |
+| `momentum_insuficiente` | RSI out of range or MACD M15 not aligned |
+| `macd_htf_desalineado` | MACD 1H against the trade direction |
+
 #### Signal Score
 
 Signals are ranked by score when multiple setups appear simultaneously. Only the top-scoring signal is executed.
@@ -245,9 +267,16 @@ To stop the bot, press `Ctrl+C`. Open TP/SL orders remain active on the exchange
 M15 candle closes
         │
         ▼
-evaluate_signal() ── all 7 filters pass? ──► score signal
+evaluate_signal() ── all 7 filters pass? ──► signal candidate
         │
-        ▼ (all valid signals sorted by score)
+        ▼
+_layered_signal_check() ── 5 validation layers pass?
+        │                       │
+        │ NO                    │ YES
+        ▼                       ▼
+  log filter reason       signal accepted
+  (trades.log)                  │
+                                ▼ (all accepted signals sorted by score)
 RiskManager.can_trade()  AND  no open position?
         │
         ├─ NO  ──► broadcast signal to Telegram, skip execution
