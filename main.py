@@ -6,8 +6,10 @@ signal evaluation, order execution, and lifecycle monitoring.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import re
+import signal
 import threading
 import time
 from datetime import datetime, timezone
@@ -467,7 +469,11 @@ def main() -> None:
     trades_logger.setLevel(logging.INFO)
     if not os.path.exists("logs"):
         os.makedirs("logs", exist_ok=True)
-    trades_handler = logging.FileHandler("logs/trades.log")
+    trades_handler = logging.handlers.RotatingFileHandler(
+        "logs/trades.log",
+        maxBytes=10 * 1024 * 1024,  # 10 MB per file
+        backupCount=5,
+    )
     trades_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
     trades_logger.addHandler(trades_handler)
 
@@ -1520,6 +1526,17 @@ def main() -> None:
             return
         threading.Thread(target=protect_and_monitor, daemon=True).start()
 
+    # Graceful shutdown on SIGTERM (docker compose down) and SIGINT (Ctrl-C)
+    _shutdown = threading.Event()
+
+    def _sighandler(signum: int, frame: object) -> None:  # noqa: ARG001
+        sig_name = signal.Signals(signum).name
+        logger.info("Signal %s received — shutting down gracefully.", sig_name)
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _sighandler)
+    signal.signal(signal.SIGINT, _sighandler)
+
     if not settings.use_paper_trading:
         try:
             _resume_orphaned_position()
@@ -1529,23 +1546,27 @@ def main() -> None:
     logger.info("Starting scheduler...")
     stream.start_scheduler(on_main_close)
 
-    try:
-        last_heartbeat = time.time()
-        while True:
-            time.sleep(1)
-            if time.time() - last_heartbeat >= settings.log_heartbeat_sec:
-                st = stream.status()
-                logger.info(
-                    "Heartbeat: bot alive | polls=%s last_close=%s next_close_in=%.0fs scheduler=%s",
-                    st.get("event_count"),
-                    st.get("last_closed_ts"),
-                    st.get("next_close_in_sec", 0),
-                    st.get("scheduler_alive"),
-                )
-                last_heartbeat = time.time()
-    except KeyboardInterrupt:
-        logger.info("Stopping...")
-        stream.stop()
+    last_heartbeat = time.time()
+    while not _shutdown.wait(timeout=1):
+        if time.time() - last_heartbeat >= settings.log_heartbeat_sec:
+            st = stream.status()
+            logger.info(
+                "Heartbeat: bot alive | polls=%s last_close=%s next_close_in=%.0fs scheduler=%s",
+                st.get("event_count"),
+                st.get("last_closed_ts"),
+                st.get("next_close_in_sec", 0),
+                st.get("scheduler_alive"),
+            )
+            # Write alive file for Docker HEALTHCHECK
+            try:
+                with open("logs/.alive", "w") as _f:
+                    _f.write(str(time.time()))
+            except OSError:
+                pass
+            last_heartbeat = time.time()
+
+    logger.info("Shutdown complete.")
+    stream.stop()
 
 
 if __name__ == "__main__":
