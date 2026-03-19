@@ -4,6 +4,14 @@ Detects candles that sweep a key liquidity level (breaking a 20-bar high/low)
 but close back inside the prior range, signalling absorption and a likely
 reversal.  Confirmation is required from the next closed candle before any
 signal is emitted.
+
+Score breakdown (max ~7.0):
+  3.0  — wick quality   (wick_ratio vs MIN_WICK_RATIO)
+  2.0  — sweep volume   (s_vol / avg_vol vs VOL_MULT)
+  1.5  — 1H perfect alignment (ema50 > ema200 AND close > ema50)
+  0.5  — 1H partial alignment (close > ema200 only)
+  0.5  — confirm candle volume (>= 1.1x avg_vol)
+ -1.0  — 1H misaligned (HTF trend against the signal)
 """
 from __future__ import annotations
 
@@ -15,10 +23,10 @@ EMA_TREND_FAST = 50
 EMA_TREND_SLOW = 200
 SWEEP_LOOKBACK = 20
 VOL_LOOKBACK = 20
-MIN_WICK_RATIO = 0.6
-VOL_MULT = 1.3
-MAX_RANGE_ATR = 2.0
-MIN_RISK_ATR = 0.5
+MIN_WICK_RATIO = 0.55   # was 0.6  — accepts slightly less perfect wicks
+VOL_MULT = 1.2          # was 1.3  — accepts slightly lower volume
+MAX_RANGE_ATR = 2.5     # was 2.0  — accepts slightly larger sweep candles
+MIN_RISK_ATR = 0.4      # was 0.5  — accepts slightly smaller risk distance
 RR_TARGET = 2.0
 
 
@@ -44,16 +52,6 @@ def _atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def _htf_bias(context_df: pd.DataFrame, ema_period: int) -> Optional[str]:
-    """Return 'LONG', 'SHORT', or None if insufficient 1H data."""
-    if context_df is None or context_df.empty or len(context_df) < ema_period:
-        return None
-    ema = _ema(context_df["close"], ema_period)
-    if ema.isna().iloc[-1]:
-        return None
-    return "LONG" if float(context_df["close"].iloc[-1]) > float(ema.iloc[-1]) else "SHORT"
-
-
 def evaluate_signal(
     main_df: pd.DataFrame,
     context_df: pd.DataFrame,
@@ -73,10 +71,12 @@ def evaluate_signal(
     """Evaluate one symbol for a Liquidity Sweep Reversal entry.
 
     Requires at least 230 M15 candles so EMA200 is meaningful.
-    Uses context_df (1H) to gate signals against the higher-timeframe trend.
+    context_df (1H) is used to compute a 4-state HTF bias that adds a
+    bonus or penalty to the final score — signals are never hard-blocked
+    by the 1H, but the score discriminates quality.
     """
     del (
-        ema_fast, ema_mid, atr_avg_window, volume_avg_window,
+        ema_trend, ema_fast, ema_mid, atr_avg_window, volume_avg_window,
         rsi_period, rsi_long_min, rsi_long_max, rsi_short_min, rsi_short_max,
         volume_min_ratio,
     )
@@ -84,16 +84,40 @@ def evaluate_signal(
     if main_df.empty or len(main_df) < 230:
         return None
 
-    # 1H bias — used both as a gate and surfaced in the signal dict
-    bias = _htf_bias(context_df, ema_trend)
+    # ── 1H bias (CAMBIO 1) ────────────────────────────────────────────────────
+    htf_bias: Optional[str] = None
+    htf_score_bonus: float = 0.0
 
+    if context_df is not None and not context_df.empty and len(context_df) >= 200:
+        h1 = context_df.copy()
+        h1["ema50"] = _ema(h1["close"], 50)
+        h1["ema200"] = _ema(h1["close"], 200)
+        last_h1 = h1.iloc[-1]
+        h1_close = float(last_h1["close"])
+        h1_ema50 = float(last_h1["ema50"])
+        h1_ema200 = float(last_h1["ema200"])
+
+        if not any(pd.isna(v) for v in [h1_ema50, h1_ema200, h1_close]):
+            if h1_ema50 > h1_ema200 and h1_close > h1_ema50:
+                htf_bias = "LONG"
+                htf_score_bonus = 1.5    # perfect alignment
+            elif h1_close > h1_ema200:
+                htf_bias = "LONG_WEAK"
+                htf_score_bonus = 0.5    # partial alignment
+            elif h1_ema50 < h1_ema200 and h1_close < h1_ema50:
+                htf_bias = "SHORT"
+                htf_score_bonus = 1.5
+            elif h1_close < h1_ema200:
+                htf_bias = "SHORT_WEAK"
+                htf_score_bonus = 0.5
+
+    # ── M15 indicators ────────────────────────────────────────────────────────
     m15 = main_df.copy()
-
     m15["ema50"] = _ema(m15["close"], EMA_TREND_FAST)
     m15["ema200"] = _ema(m15["close"], EMA_TREND_SLOW)
     m15["atr"] = _atr(m15, atr_period)
     m15["avg_vol20"] = m15["volume"].rolling(VOL_LOOKBACK).mean()
-    # Reference levels are shifted so the sweep candle itself is excluded.
+    # Reference levels shifted so the sweep candle itself is excluded.
     m15["highest_high_20"] = m15["high"].rolling(SWEEP_LOOKBACK).max().shift(1)
     m15["lowest_low_20"] = m15["low"].rolling(SWEEP_LOOKBACK).min().shift(1)
 
@@ -125,6 +149,7 @@ def evaluate_signal(
     c_high = float(confirm["high"])
     c_low = float(confirm["low"])
     c_close = float(confirm["close"])
+    confirm_vol = float(confirm.get("volume", 0))
 
     if atr_val <= 0 or avg_vol <= 0:
         return None
@@ -143,93 +168,117 @@ def evaluate_signal(
     )
 
     # ── LONG ──────────────────────────────────────────────────────────────────
-    # Gate: 1H bias must be LONG or unknown (permissive when data insufficient)
-    if bias is None or bias == "LONG":
-        if s_close > ema200 and ema50 > ema200:               # 1. trend bullish
-            if s_low < lowest_20:                              # 2. bearish sweep
-                if s_close > lowest_20:                        # 3. false breakout
-                    lower_wick = min(s_open, s_close) - s_low
-                    wick_ratio = lower_wick / sweep_range
-                    if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
-                        if s_vol >= VOL_MULT * avg_vol:        # 5. volume
-                            if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
-                                if c_high > s_high and c_close > s_close:  # 7. confirm
-                                    stop_price = s_low
-                                    risk = entry_price - stop_price
-                                    if risk >= MIN_RISK_ATR * atr_val and risk > 0:
-                                        tp_price = entry_price + risk * RR_TARGET
-                                        score = round(
-                                            min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
-                                            + min(2.0, (s_vol / avg_vol - VOL_MULT)),
-                                            2,
-                                        )
-                                        return {
-                                            "side": "BUY",
-                                            "price": entry_price,
-                                            "stop_price": stop_price,
-                                            "tp_price": tp_price,
-                                            "risk_per_unit": risk,
-                                            "rr_target": RR_TARGET,
-                                            "atr": atr_val,
-                                            "score": score,
-                                            "strategy": "liquidity_sweep_reversal",
-                                            "htf_bias": bias or "LONG",
-                                            "estructura_valida": True,
-                                            "retroceso_valido": True,
-                                            "volumen_confirmado": True,
-                                            "volume_ok": True,
-                                            "confirm_m15": (
-                                                f"Sweep below {lowest_20:.4f} | "
-                                                f"wick={wick_ratio:.2f} | "
-                                                f"vol={s_vol/avg_vol:.1f}x | "
-                                                f"confirm close={c_close:.4f}"
-                                            ),
-                                            "breakout_time": timestamp,
-                                        }
+    if s_close > ema200 and ema50 > ema200:               # 1. trend bullish
+        if s_low < lowest_20:                              # 2. bearish sweep
+            if s_close > lowest_20:                        # 3. false breakout
+                lower_wick = min(s_open, s_close) - s_low
+                wick_ratio = lower_wick / sweep_range
+                if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
+                    if s_vol >= VOL_MULT * avg_vol:        # 5. volume
+                        if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
+                            if c_high > s_high and c_close > s_close:  # 7. confirm
+                                stop_price = s_low
+                                risk = entry_price - stop_price
+                                if risk >= MIN_RISK_ATR * atr_val and risk > 0:
+                                    tp_price = entry_price + risk * RR_TARGET
+
+                                    # CAMBIO 2 — HTF bonus/penalty
+                                    htf_aligned = htf_bias in ("LONG", "LONG_WEAK")
+                                    htf_penalty = -1.0 if htf_bias in ("SHORT", "SHORT_WEAK") else 0.0
+                                    htf_bonus = htf_score_bonus if htf_aligned else htf_penalty
+
+                                    score = round(
+                                        min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
+                                        + min(2.0, (s_vol / avg_vol - VOL_MULT))
+                                        + htf_bonus,
+                                        2,
+                                    )
+
+                                    # CAMBIO 5 — confirm candle volume bonus
+                                    vol_confirm_bonus = 0.5 if confirm_vol >= 1.1 * avg_vol else 0.0
+                                    score += vol_confirm_bonus
+                                    score = round(score, 2)
+
+                                    return {
+                                        "side": "BUY",
+                                        "price": entry_price,
+                                        "stop_price": stop_price,
+                                        "tp_price": tp_price,
+                                        "risk_per_unit": risk,
+                                        "rr_target": RR_TARGET,
+                                        "atr": atr_val,
+                                        "score": score,
+                                        "strategy": "liquidity_sweep_reversal",
+                                        "htf_bias": htf_bias or "NONE",      # CAMBIO 3
+                                        "htf_score_bonus": htf_score_bonus,  # CAMBIO 3
+                                        "estructura_valida": True,
+                                        "retroceso_valido": True,
+                                        "volumen_confirmado": True,
+                                        "volume_ok": True,
+                                        "confirm_m15": (
+                                            f"Sweep below {lowest_20:.4f} | "
+                                            f"wick={wick_ratio:.2f} | "
+                                            f"vol={s_vol/avg_vol:.1f}x | "
+                                            f"confirm close={c_close:.4f}"
+                                        ),
+                                        "breakout_time": timestamp,
+                                    }
 
     # ── SHORT ─────────────────────────────────────────────────────────────────
-    # Gate: 1H bias must be SHORT or unknown
-    if bias is None or bias == "SHORT":
-        if s_close < ema200 and ema50 < ema200:               # 1. trend bearish
-            if s_high > highest_20:                            # 2. bullish sweep
-                if s_close < highest_20:                       # 3. false breakout
-                    upper_wick = s_high - max(s_open, s_close)
-                    wick_ratio = upper_wick / sweep_range
-                    if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
-                        if s_vol >= VOL_MULT * avg_vol:        # 5. volume
-                            if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
-                                if c_low < s_low and c_close < s_close:  # 7. confirm
-                                    stop_price = s_high
-                                    risk = stop_price - entry_price
-                                    if risk >= MIN_RISK_ATR * atr_val and risk > 0:
-                                        tp_price = entry_price - risk * RR_TARGET
-                                        score = round(
-                                            min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
-                                            + min(2.0, (s_vol / avg_vol - VOL_MULT)),
-                                            2,
-                                        )
-                                        return {
-                                            "side": "SELL",
-                                            "price": entry_price,
-                                            "stop_price": stop_price,
-                                            "tp_price": tp_price,
-                                            "risk_per_unit": risk,
-                                            "rr_target": RR_TARGET,
-                                            "atr": atr_val,
-                                            "score": score,
-                                            "strategy": "liquidity_sweep_reversal",
-                                            "htf_bias": bias or "SHORT",
-                                            "estructura_valida": True,
-                                            "retroceso_valido": True,
-                                            "volumen_confirmado": True,
-                                            "volume_ok": True,
-                                            "confirm_m15": (
-                                                f"Sweep above {highest_20:.4f} | "
-                                                f"wick={wick_ratio:.2f} | "
-                                                f"vol={s_vol/avg_vol:.1f}x | "
-                                                f"confirm close={c_close:.4f}"
-                                            ),
-                                            "breakout_time": timestamp,
-                                        }
+    if s_close < ema200 and ema50 < ema200:               # 1. trend bearish
+        if s_high > highest_20:                            # 2. bullish sweep
+            if s_close < highest_20:                       # 3. false breakout
+                upper_wick = s_high - max(s_open, s_close)
+                wick_ratio = upper_wick / sweep_range
+                if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
+                    if s_vol >= VOL_MULT * avg_vol:        # 5. volume
+                        if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
+                            if c_low < s_low and c_close < s_close:  # 7. confirm
+                                stop_price = s_high
+                                risk = stop_price - entry_price
+                                if risk >= MIN_RISK_ATR * atr_val and risk > 0:
+                                    tp_price = entry_price - risk * RR_TARGET
+
+                                    # CAMBIO 2 — HTF bonus/penalty
+                                    htf_aligned = htf_bias in ("SHORT", "SHORT_WEAK")
+                                    htf_penalty = -1.0 if htf_bias in ("LONG", "LONG_WEAK") else 0.0
+                                    htf_bonus = htf_score_bonus if htf_aligned else htf_penalty
+
+                                    score = round(
+                                        min(3.0, (wick_ratio - MIN_WICK_RATIO) / (1 - MIN_WICK_RATIO) * 3)
+                                        + min(2.0, (s_vol / avg_vol - VOL_MULT))
+                                        + htf_bonus,
+                                        2,
+                                    )
+
+                                    # CAMBIO 5 — confirm candle volume bonus
+                                    vol_confirm_bonus = 0.5 if confirm_vol >= 1.1 * avg_vol else 0.0
+                                    score += vol_confirm_bonus
+                                    score = round(score, 2)
+
+                                    return {
+                                        "side": "SELL",
+                                        "price": entry_price,
+                                        "stop_price": stop_price,
+                                        "tp_price": tp_price,
+                                        "risk_per_unit": risk,
+                                        "rr_target": RR_TARGET,
+                                        "atr": atr_val,
+                                        "score": score,
+                                        "strategy": "liquidity_sweep_reversal",
+                                        "htf_bias": htf_bias or "NONE",      # CAMBIO 3
+                                        "htf_score_bonus": htf_score_bonus,  # CAMBIO 3
+                                        "estructura_valida": True,
+                                        "retroceso_valido": True,
+                                        "volumen_confirmado": True,
+                                        "volume_ok": True,
+                                        "confirm_m15": (
+                                            f"Sweep above {highest_20:.4f} | "
+                                            f"wick={wick_ratio:.2f} | "
+                                            f"vol={s_vol/avg_vol:.1f}x | "
+                                            f"confirm close={c_close:.4f}"
+                                        ),
+                                        "breakout_time": timestamp,
+                                    }
 
     return None
