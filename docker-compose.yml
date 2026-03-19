@@ -1,0 +1,9 @@
+services:
+  binance_bot:
+    build: .
+    container_name: binance_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
