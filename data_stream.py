@@ -20,6 +20,7 @@ from typing import Callable, Dict, Optional
 
 import pandas as pd
 from binance import Client
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,11 @@ class MarketDataStream:
     ) -> None:
         """Initialize stream configuration and caches without opening connections."""
         self.client = client
+        # Expand connection pool to match the polling semaphore (20 concurrent
+        # requests). Default pool_maxsize=10 causes "pool is full" warnings.
+        _adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25)
+        self.client.session.mount("https://", _adapter)
+        self.client.session.mount("http://", _adapter)
         self.symbols = [s.upper() for s in symbols]
         self.main_interval = main_interval
         self.main_limit = main_limit
