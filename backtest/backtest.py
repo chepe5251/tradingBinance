@@ -29,7 +29,7 @@ from strategy import evaluate_signal  # noqa: E402
 BACKTEST_DAYS = 30
 TOP_SYMBOLS = 50
 INTERVALS = ["15m", "1h", "4h"]
-CANDLES_PER_INTERVAL: dict[str, int] = {"15m": 2880, "1h": 720, "4h": 180}
+CANDLES_PER_INTERVAL: dict[str, int] = {"15m": 1500, "1h": 720, "4h": 500}
 INITIAL_CAPITAL = 100.0
 MARGIN_PER_TRADE = 5.0
 LEVERAGE = 10

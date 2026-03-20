@@ -198,42 +198,6 @@ def _calc_atr(df, period: int) -> float:
     return float(atr.iloc[-1]) if not atr.isna().iloc[-1] else 0.0
 
 
-def _calc_atr_avg(df, period: int, window: int) -> float:
-    """Compute rolling ATR average for volatility regime checks."""
-    if df.empty or len(df) < period + window + 2:
-        return 0.0
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = (
-        (high - low).abs()
-        .to_frame("hl")
-        .join((high - prev_close).abs().to_frame("hc"))
-        .join((low - prev_close).abs().to_frame("lc"))
-        .max(axis=1)
-    )
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    atr_avg = atr.rolling(window=window).mean()
-    return float(atr_avg.iloc[-1]) if not atr_avg.isna().iloc[-1] else 0.0
-
-
-def _calc_rsi(df, period: int) -> float:
-    """Compute latest RSI value using EWMA gains/losses."""
-    if df.empty or len(df) < period + 2:
-        return 0.0
-    close = df["close"]
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    last = rsi.iloc[-1]
-    return float(last) if last == last else 0.0
-
-
 def _get_mark_price(client: Client, symbol: str) -> float | None:
     """Fetch mark price for one symbol; return None on API error."""
     try:
@@ -287,117 +251,6 @@ def _send_telegram_message(token: str, chat_id: str, message: str) -> None:
                 time.sleep(min(float(attempt), 5.0))
     if last_exc is not None:
         raise last_exc
-
-
-def _fmt_side(side: str) -> str:
-    """Map exchange side to operator-facing direction label."""
-    if side == "BUY":
-        return "LONG"
-    if side == "SELL":
-        return "SHORT"
-    return side
-
-
-def _macd_ok(df, side: str) -> bool:
-    """Validate directional MACD alignment for final momentum gating."""
-    if df.empty or len(df) < 35:
-        return False
-    close = df["close"]
-    ema_fast = close.ewm(span=12, adjust=False).mean()
-    ema_slow = close.ewm(span=26, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    hist = macd_line - signal_line
-    macd_last = float(macd_line.iloc[-1])
-    signal_last = float(signal_line.iloc[-1])
-    hist_last = float(hist.iloc[-1])
-    if side == "BUY":
-        return macd_last > signal_last and hist_last > 0
-    if side == "SELL":
-        return macd_last < signal_last and hist_last < 0
-    return False
-
-
-def _layered_signal_check(
-    signal: dict | None,
-    df,
-    ctx,
-    side: str | None,
-    ctx_dir: str | None,
-    trend_clear: bool,
-    ema_fast_period: int,
-    atr_val: float,
-    volume_ok: bool,
-    rsi_last: float,
-) -> tuple[bool, str]:
-    """Apply layered hard filters before allowing a signal for execution."""
-    if not signal or not side:
-        return False, "sin_senal"
-
-    # CAPA 1: contexto HTF alineado (veto obligatorio)
-    if side == "BUY":
-        layer_1_ok = ctx_dir == "LONG" and trend_clear
-    elif side == "SELL":
-        layer_1_ok = ctx_dir == "SHORT" and trend_clear
-    else:
-        layer_1_ok = False
-    if not layer_1_ok:
-        return False, "contexto_htf_desalineado"
-
-    # CAPA 2: estructura clara (veto obligatorio)
-    estructura_valida = bool(signal.get("estructura_valida") or signal.get("structure_ok"))
-    retroceso_valido = bool(signal.get("retroceso_valido"))
-    layer_2_ok = estructura_valida and retroceso_valido and trend_clear
-    if not layer_2_ok:
-        return False, "estructura_no_valida"
-
-    # CAPA 3: no sobreextension / no FOMO (veto obligatorio)
-    if df.empty or len(df) < max(ema_fast_period, 2):
-        return False, "datos_insuficientes"
-    price = float(signal.get("price") or 0.0)
-    if price <= 0 or atr_val <= 0:
-        return False, "atr_o_precio_invalido"
-    ema_fast_series = _ema(df["close"], ema_fast_period)
-    ema_fast_last = float(ema_fast_series.iloc[-1])
-    distance_fast_atr = abs(price - ema_fast_last) / atr_val if atr_val > 0 else 999.0
-    last = df.iloc[-1]
-    entry_body = abs(float(last["close"] - last["open"]))
-    layer_3_ok = distance_fast_atr <= 1.8 and entry_body <= (2.0 * atr_val)
-    if not layer_3_ok:
-        return False, "sobreextension_o_fomo"
-
-    # CAPA 4: momentum M15 (veto obligatorio)
-    volumen_confirmado = bool(signal.get("volumen_confirmado") or signal.get("volume_ok"))
-    if side == "BUY":
-        rsi_ok = 40.0 <= rsi_last <= 70.0
-    else:
-        rsi_ok = 30.0 <= rsi_last <= 60.0
-    macd_ok = _macd_ok(df, side)
-    layer_4_ok = volume_ok and volumen_confirmado and rsi_ok and macd_ok
-    if not layer_4_ok:
-        return False, "momentum_insuficiente"
-
-    # CAPA 5: MACD 1H alineado — evita entrar contra el momentum HTF (veto obligatorio)
-    if ctx is not None and not ctx.empty and len(ctx) >= 35:
-        if not _macd_ok(ctx, side):
-            return False, "macd_htf_desalineado"
-
-    return True, "ok"
-
-
-def _fmt_validation_reason(reason: str) -> str:
-    """Translate internal reject codes to readable Spanish labels."""
-    mapping = {
-        "contexto_htf_desalineado": "Contexto HTF desalineado",
-        "estructura_no_valida": "Estructura de pullback no valida",
-        "datos_insuficientes": "Datos insuficientes",
-        "atr_o_precio_invalido": "ATR o precio invalido",
-        "sobreextension_o_fomo": "Precio sobreextendido o vela FOMO",
-        "momentum_insuficiente": "Momentum sin confirmacion",
-        "macd_htf_desalineado": "MACD 1H contra la direccion del trade",
-        "sin_senal": "No hay setup operativo",
-    }
-    return mapping.get(reason, reason)
 
 
 def _format_signal_message(
@@ -870,8 +723,6 @@ def main() -> None:
                     sig_entry = sig_signal["price"] * (1 + settings.limit_offset_pct)
 
                 sig_atr_val = float(sig_signal.get("atr") or 0.0)
-                sig_atr_avg = float(sig_signal.get("atr_avg") or 0.0)
-                sig_atr_ratio = (sig_atr_val / sig_atr_avg) if sig_atr_avg > 0 else 0.0
                 sig_risk = float(sig_signal.get("risk_per_unit") or 0.0)
                 sig_rr = max(float(sig_signal.get("rr_target") or 0.0), 1.8)
                 sig_risk_distance = sig_risk if sig_risk > 0 else max(
@@ -888,8 +739,8 @@ def main() -> None:
                     sig_sl = sig_entry + sig_risk_distance
                     sig_tp = sig_entry - (sig_risk_distance * sig_rr)
                 sig_rr_value = abs(sig_tp - sig_entry) / abs(sig_entry - sig_sl) if sig_entry != sig_sl else 0.0
-                sig_quality = "A+" if sig_atr_ratio >= 1.2 else "A"
-                sig_volatility = "Alta" if sig_atr_ratio >= 1.2 else "Normal"
+                sig_quality = "A"
+                sig_volatility = "Normal"
                 sig_htf_bias = str(sig_signal.get("htf_bias") or ("LONG" if sig_side == "BUY" else "SHORT"))
                 tg_send(
                     _format_signal_message(
@@ -1122,8 +973,6 @@ def main() -> None:
                         return None
                     mark = float(mark)
                     sl_ref_price = float(trade_state["sl"])
-                    entry_ref = float(trade_state.get("anchor_entry_price", trade_state["entry_price"]))
-                    risk_ref = max(0.0, float(trade_state.get("anchor_risk_distance", abs(entry_ref - sl_ref_price))))
 
                     def _defer_level(level_key: str, reason: str, exc: Exception | None = None) -> None:
                         """Back off failed scale attempts and disable level after max retries."""
