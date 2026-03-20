@@ -465,15 +465,17 @@ def main() -> None:
     logger = logging.getLogger("bot")
     trades_logger = logging.getLogger("trades")
     trades_logger.setLevel(logging.INFO)
-    if not os.path.exists("logs"):
+    try:
         os.makedirs("logs", exist_ok=True)
-    trades_handler = logging.handlers.RotatingFileHandler(
-        "logs/trades.log",
-        maxBytes=10 * 1024 * 1024,  # 10 MB per file
-        backupCount=5,
-    )
-    trades_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-    trades_logger.addHandler(trades_handler)
+        trades_handler = logging.handlers.RotatingFileHandler(
+            "logs/trades.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+        )
+        trades_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        trades_logger.addHandler(trades_handler)
+    except PermissionError:
+        logging.warning("Cannot write logs/trades.log (permission denied) — trades will log to stdout only")
 
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
