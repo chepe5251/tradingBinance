@@ -1,14 +1,22 @@
-"""Order Block + Break of Structure (OB+BOS) signal engine for M15 futures.
+"""EMA Pullback Long-Only signal engine for M15 futures (backtest-optimized).
 
-Detects institutional order blocks by identifying a Break of Structure (BOS)
-followed by a price return to the origin zone. Entry is anticipatory —
-the bot enters when price returns to the institutional zone, not after
-the move has already happened.
+Detects high-probability pullback entries by waiting for price to retrace
+to EMA20 within a well-aligned EMA20/50/200 uptrend, then requiring a
+bullish rejection candle followed by a break-of-high confirmation candle.
 
-Score breakdown (max ~6.0):
-  3.0  — wick quality      (wick_ratio vs OB_WICK_RATIO baseline)
-  2.0  — volume strength   (current_vol / avg_vol vs OB_VOL_MULT)
-  1.0  — OB freshness      (newer BOS = higher score; decays linearly)
+This version is LONG-ONLY. Shorts were removed after backtesting showed
+205 short trades at 35.5% WR and -18.12 USDT net PnL across all timeframes.
+
+Key backtest findings that shaped the filters:
+  - Vol >1.5x avg: -4.16 USDT (exhaustion/liquidation spikes)
+  - RSI <40 at signal: 28.7% WR and -20.19 USDT (actual weakness, not rest)
+  - EMA spread >1.0 ATR: -26.31 USDT in 142 trades (overextended trend)
+  - Score <1.5: 23.1% WR (too many marginal setups)
+
+Score breakdown (max ~4.0):
+  2.0  — body quality   (body_ratio vs MIN_BODY_RATIO baseline)
+  1.0  — RSI sweet spot (RSI in 53-63 zone = 1.0, otherwise 0)
+  1.0  — EMA spread     (EMA20-EMA50 separation relative to ATR, capped at 1.0)
 """
 from __future__ import annotations
 
@@ -16,17 +24,24 @@ from typing import Optional
 
 import pandas as pd
 
-EMA_FAST = 50
-EMA_SLOW = 200
-BOS_LOOKBACK = 20          # bars to look back for structure high/low
-BOS_BODY_RATIO = 0.60      # minimum body ratio for BOS candle
-BOS_VOL_MULT = 1.5         # minimum volume multiplier for BOS candle
-OB_WICK_RATIO = 0.40       # minimum wick ratio for OB rejection candle
-OB_VOL_MULT = 1.2          # minimum volume for OB rejection candle
-VOL_LOOKBACK = 20          # bars for average volume calculation
-RR_TARGET = 2.5            # risk:reward target
-MIN_RISK_ATR = 0.3         # minimum risk in ATR units
-MAX_OB_AGE = 10            # maximum candles since BOS before OB expires
+EMA_FAST               = 20
+EMA_MID                = 50
+EMA_SLOW               = 200
+RSI_PERIOD             = 14
+VOL_LOOKBACK           = 20
+ATR_PERIOD             = 14
+MIN_VOL_MULT           = 1.05
+MAX_VOL_MULT           = 1.5
+RSI_LONG_MIN           = 48.0
+RSI_LONG_MAX           = 68.0
+MIN_BODY_RATIO         = 0.35
+RR_TARGET              = 2.0
+MIN_RISK_ATR           = 0.5
+MAX_RISK_ATR           = 3.0
+PULLBACK_TOLERANCE_ATR = 0.8
+MIN_EMA_SPREAD_ATR     = 0.15
+MAX_EMA_SPREAD_ATR     = 1.0
+MIN_SCORE              = 1.5
 
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
@@ -47,6 +62,16 @@ def _atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def _rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
 def evaluate_signal(
     main_df: pd.DataFrame,
     context_df: pd.DataFrame,
@@ -63,10 +88,11 @@ def evaluate_signal(
     rsi_short_max: float,
     volume_min_ratio: float,
 ) -> Optional[dict]:
-    """Evaluate one symbol for an Order Block + BOS entry.
+    """Evaluate one symbol for an EMA Pullback Long entry.
 
-    Requires at least 230 M15 candles so EMA200 is meaningful.
-    context_df is accepted for API compatibility but not used by this strategy.
+    Requires at least 230 candles so EMA200 is meaningful.
+    context_df and most parameters are accepted for API compatibility
+    but this strategy uses the fixed constants defined at module level.
     """
     del (
         ema_trend, ema_fast, ema_mid, atr_avg_window, volume_avg_window,
@@ -78,212 +104,147 @@ def evaluate_signal(
         return None
 
     df = main_df.copy()
-    df["ema50"] = _ema(df["close"], EMA_FAST)
-    df["ema200"] = _ema(df["close"], EMA_SLOW)
-    df["atr"] = _atr(df, atr_period)
+    df["ema20"]   = _ema(df["close"], EMA_FAST)
+    df["ema50"]   = _ema(df["close"], EMA_MID)
+    df["ema200"]  = _ema(df["close"], EMA_SLOW)
+    df["atr"]     = _atr(df, ATR_PERIOD)
     df["avg_vol"] = df["volume"].rolling(VOL_LOOKBACK).mean()
-    df["body"] = (df["close"] - df["open"]).abs()
-    df["range"] = df["high"] - df["low"]
-    df["body_ratio"] = df["body"] / df["range"].replace(0, float("nan"))
-    # Shifted so the BOS candle itself is not included in its own lookback
-    df["highest_high_bos"] = df["high"].rolling(BOS_LOOKBACK).max().shift(1)
-    df["lowest_low_bos"] = df["low"].rolling(BOS_LOOKBACK).min().shift(1)
+    df["rsi"]     = _rsi(df["close"], RSI_PERIOD)
 
-    current = df.iloc[-1]
+    if len(df) < 3:
+        return None
+
+    # ── extract candles ───────────────────────────────────────────────────────
+    sig  = df.iloc[-2]   # signal candle  — shows pullback + rejection
+    conf = df.iloc[-1]   # confirmation candle — just closed, confirms direction
+    prev = df.iloc[-3]   # candle before signal
+
+    s_open    = float(sig["open"])
+    s_close   = float(sig["close"])
+    s_high    = float(sig["high"])
+    s_low     = float(sig["low"])
+    s_vol     = float(sig["volume"])
+    s_ema20   = float(sig["ema20"])
+    s_ema50   = float(sig["ema50"])
+    s_ema200  = float(sig["ema200"])
+    s_atr     = float(sig["atr"])
+    s_avg_vol = float(sig["avg_vol"])
+    s_rsi     = float(sig["rsi"])
+
+    c_open  = float(conf["open"])
+    c_close = float(conf["close"])
+    c_high  = float(conf["high"])
+    c_low   = float(conf["low"])
+
+    p_close = float(prev["close"])
+    p_ema20 = float(prev["ema20"])
+
+    # ── NaN / validity checks ─────────────────────────────────────────────────
     required = [
-        current["ema50"], current["ema200"], current["atr"], current["avg_vol"],
-        current["high"], current["low"], current["open"], current["close"],
-        current["volume"],
+        s_open, s_close, s_high, s_low, s_vol,
+        s_ema20, s_ema50, s_ema200, s_atr, s_avg_vol, s_rsi,
+        c_open, c_close, c_high, c_low,
+        p_close, p_ema20,
     ]
-    if any(pd.isna(v) for v in required):
+    if any(v != v for v in required):   # NaN != NaN
         return None
 
-    ema50_cur = float(current["ema50"])
-    ema200_cur = float(current["ema200"])
-    atr_val = float(current["atr"])
-    avg_vol_cur = float(current["avg_vol"])
-
-    if atr_val <= 0 or avg_vol_cur <= 0:
+    if s_atr <= 0 or s_avg_vol <= 0:
         return None
 
-    cur_close = float(current["close"])
-    cur_low = float(current["low"])
-    cur_high = float(current["high"])
-    cur_open = float(current["open"])
-    cur_vol = float(current["volume"])
-    cur_range = cur_high - cur_low
-
-    if cur_range <= 0:
+    rng = s_high - s_low
+    if rng <= 0:
         return None
 
-    ts = current.get("close_time")
+    body        = abs(s_close - s_open)
+    body_ratio  = body / rng
+    entry_price = c_close
+
+    ts = conf.get("close_time")
     timestamp = (
         ts.strftime("%Y-%m-%d %H:%M:%S UTC")
         if isinstance(ts, pd.Timestamp)
         else str(ts)
     )
 
-    n = len(df)
-    # Scan bars before the current one; allow enough history for BOS lookback
-    scan_end = n - 1      # exclusive: current bar is the rejection candle
-    scan_start = max(0, scan_end - (MAX_OB_AGE + 5))
-
-    # ── helpers ──────────────────────────────────────────────────────────────
-
-    def _find_bos_long():
-        """Return (bos_idx, ob_candle) for the most recent valid LONG BOS."""
-        for i in range(scan_end - 1, scan_start - 1, -1):
-            bar = df.iloc[i]
-            needed = ["highest_high_bos", "avg_vol", "body_ratio",
-                      "high", "low", "open", "close", "volume"]
-            if any(pd.isna(bar[c]) for c in needed):
-                continue
-            if float(bar["range"]) <= 0:
-                continue
-            # BOS: strong bullish candle breaks above prior structure high
-            if not (
-                float(bar["high"]) > float(bar["highest_high_bos"])
-                and float(bar["body_ratio"]) >= BOS_BODY_RATIO
-                and float(bar["volume"]) >= BOS_VOL_MULT * float(bar["avg_vol"])
-                and float(bar["close"]) > float(bar["open"])
-            ):
-                continue
-            # Order Block: last bearish candle immediately before the BOS candle
-            for j in range(i - 1, max(0, i - 10), -1):
-                ob = df.iloc[j]
-                if float(ob["close"]) < float(ob["open"]):
-                    return i, ob
+    # ── LONG setup ────────────────────────────────────────────────────────────
+    # 1. Structural uptrend: EMA20 > EMA50 > EMA200
+    if not (s_ema20 > s_ema50 and s_ema50 > s_ema200):
         return None
 
-    def _find_bos_short():
-        """Return (bos_idx, ob_candle) for the most recent valid SHORT BOS."""
-        for i in range(scan_end - 1, scan_start - 1, -1):
-            bar = df.iloc[i]
-            needed = ["lowest_low_bos", "avg_vol", "body_ratio",
-                      "high", "low", "open", "close", "volume"]
-            if any(pd.isna(bar[c]) for c in needed):
-                continue
-            if float(bar["range"]) <= 0:
-                continue
-            # BOS: strong bearish candle breaks below prior structure low
-            if not (
-                float(bar["low"]) < float(bar["lowest_low_bos"])
-                and float(bar["body_ratio"]) >= BOS_BODY_RATIO
-                and float(bar["volume"]) >= BOS_VOL_MULT * float(bar["avg_vol"])
-                and float(bar["close"]) < float(bar["open"])
-            ):
-                continue
-            # Order Block: last bullish candle immediately before the BOS candle
-            for j in range(i - 1, max(0, i - 10), -1):
-                ob = df.iloc[j]
-                if float(ob["close"]) > float(ob["open"]):
-                    return i, ob
+    spread = s_ema20 - s_ema50
+
+    # 2. Minimum EMA separation — filters flat/ranging markets
+    if spread < MIN_EMA_SPREAD_ATR * s_atr:
         return None
 
-    def _score(wick_ratio: float, vol_ratio: float, ob_age: int) -> float:
-        wick_score = min(3.0, (wick_ratio - OB_WICK_RATIO) / (1 - OB_WICK_RATIO) * 3)
-        vol_score = min(2.0, vol_ratio - OB_VOL_MULT)
-        freshness_score = min(1.0, (MAX_OB_AGE - ob_age) / MAX_OB_AGE)
-        return round(wick_score + vol_score + freshness_score, 2)
+    # 3. Trend not overextended — spread >1.0 ATR = pullbacks don't bounce
+    if spread > MAX_EMA_SPREAD_ATR * s_atr:
+        return None
 
-    # ── LONG ─────────────────────────────────────────────────────────────────
-    if cur_close > ema200_cur and ema50_cur > ema200_cur:
-        result = _find_bos_long()
-        if result is not None:
-            bos_idx, ob_candle = result
-            ob_age = (n - 1) - bos_idx
-            if ob_age <= MAX_OB_AGE:
-                ob_high = float(ob_candle["high"])
-                ob_low = float(ob_candle["low"])
-                # OB integrity: no close below ob_low between BOS and current bar
-                ob_intact = all(
-                    float(df.iloc[k]["close"]) >= ob_low
-                    for k in range(bos_idx + 1, n - 1)
-                )
-                if ob_intact and ob_low <= cur_low <= ob_high:
-                    if cur_close > ob_low:                      # not violated on close
-                        lower_wick = min(cur_open, cur_close) - cur_low
-                        wick_ratio = lower_wick / cur_range
-                        if wick_ratio >= OB_WICK_RATIO:
-                            if cur_vol >= OB_VOL_MULT * avg_vol_cur:
-                                stop_price = ob_low - (0.1 * atr_val)
-                                risk = cur_close - stop_price
-                                if risk >= MIN_RISK_ATR * atr_val and risk > 0:
-                                    tp_price = cur_close + risk * RR_TARGET
-                                    return {
-                                        "side": "BUY",
-                                        "price": cur_close,
-                                        "stop_price": stop_price,
-                                        "tp_price": tp_price,
-                                        "risk_per_unit": risk,
-                                        "rr_target": RR_TARGET,
-                                        "atr": atr_val,
-                                        "score": _score(wick_ratio, cur_vol / avg_vol_cur, ob_age),
-                                        "strategy": "ob_bos",
-                                        "htf_bias": "LONG",
-                                        "htf_score_bonus": 0.0,
-                                        "estructura_valida": True,
-                                        "retroceso_valido": True,
-                                        "volumen_confirmado": True,
-                                        "volume_ok": True,
-                                        "confirm_m15": (
-                                            f"OB zone {ob_low:.4f}-{ob_high:.4f} | "
-                                            f"BOS age={ob_age} candles | "
-                                            f"wick={wick_ratio:.2f} | "
-                                            f"vol={cur_vol/avg_vol_cur:.1f}x | "
-                                            f"close={cur_close:.4f}"
-                                        ),
-                                        "breakout_time": timestamp,
-                                    }
+    # 4. Price pulled back to EMA20 (signal candle low within tolerance band)
+    tol = PULLBACK_TOLERANCE_ATR * s_atr
+    if not (s_low <= s_ema20 + tol and s_low >= s_ema20 - tol):
+        return None
 
-    # ── SHORT ─────────────────────────────────────────────────────────────────
-    if cur_close < ema200_cur and ema50_cur < ema200_cur:
-        result = _find_bos_short()
-        if result is not None:
-            bos_idx, ob_candle = result
-            ob_age = (n - 1) - bos_idx
-            if ob_age <= MAX_OB_AGE:
-                ob_high = float(ob_candle["high"])
-                ob_low = float(ob_candle["low"])
-                # OB integrity: no close above ob_high between BOS and current bar
-                ob_intact = all(
-                    float(df.iloc[k]["close"]) <= ob_high
-                    for k in range(bos_idx + 1, n - 1)
-                )
-                if ob_intact and ob_low <= cur_high <= ob_high:
-                    if cur_close < ob_high:                     # not violated on close
-                        upper_wick = cur_high - max(cur_open, cur_close)
-                        wick_ratio = upper_wick / cur_range
-                        if wick_ratio >= OB_WICK_RATIO:
-                            if cur_vol >= OB_VOL_MULT * avg_vol_cur:
-                                stop_price = ob_high + (0.1 * atr_val)
-                                risk = stop_price - cur_close
-                                if risk >= MIN_RISK_ATR * atr_val and risk > 0:
-                                    tp_price = cur_close - risk * RR_TARGET
-                                    return {
-                                        "side": "SELL",
-                                        "price": cur_close,
-                                        "stop_price": stop_price,
-                                        "tp_price": tp_price,
-                                        "risk_per_unit": risk,
-                                        "rr_target": RR_TARGET,
-                                        "atr": atr_val,
-                                        "score": _score(wick_ratio, cur_vol / avg_vol_cur, ob_age),
-                                        "strategy": "ob_bos",
-                                        "htf_bias": "SHORT",
-                                        "htf_score_bonus": 0.0,
-                                        "estructura_valida": True,
-                                        "retroceso_valido": True,
-                                        "volumen_confirmado": True,
-                                        "volume_ok": True,
-                                        "confirm_m15": (
-                                            f"OB zone {ob_low:.4f}-{ob_high:.4f} | "
-                                            f"BOS age={ob_age} candles | "
-                                            f"wick={wick_ratio:.2f} | "
-                                            f"vol={cur_vol/avg_vol_cur:.1f}x | "
-                                            f"close={cur_close:.4f}"
-                                        ),
-                                        "breakout_time": timestamp,
-                                    }
+    # 5. Did not break EMA50 — structure intact
+    if s_close <= s_ema50:
+        return None
 
-    return None
+    # 6. RSI in healthy pullback zone (not weak, not overbought)
+    if not (RSI_LONG_MIN <= s_rsi <= RSI_LONG_MAX):
+        return None
+
+    # 7. Bullish rejection candle closing in upper third of its range
+    upper_third = s_low + (2 / 3) * rng
+    if not (body_ratio >= MIN_BODY_RATIO and s_close > s_open and s_close > upper_third):
+        return None
+
+    # 8. Volume in optimal range — confirms interest without exhaustion spike
+    if not (s_vol >= MIN_VOL_MULT * s_avg_vol and s_vol <= MAX_VOL_MULT * s_avg_vol):
+        return None
+
+    # 9. Confirmation candle breaks above signal candle high
+    if c_close <= s_high:
+        return None
+
+    # ── levels ────────────────────────────────────────────────────────────────
+    stop_price = s_low - (0.1 * s_atr)
+    risk       = entry_price - stop_price
+    if risk < MIN_RISK_ATR * s_atr or risk > MAX_RISK_ATR * s_atr:
+        return None
+
+    tp_price   = entry_price + risk * RR_TARGET
+    spread_atr = spread / s_atr
+
+    # ── score ─────────────────────────────────────────────────────────────────
+    score = round(
+        min(2.0, ((body_ratio - MIN_BODY_RATIO) / (1 - MIN_BODY_RATIO)) * 2)
+        + (1.0 if (RSI_LONG_MIN + 5) < s_rsi < (RSI_LONG_MAX - 5) else 0)
+        + min(1.0, (spread_atr - MIN_EMA_SPREAD_ATR) * 2),
+        2,
+    )
+
+    if score < MIN_SCORE:
+        return None
+
+    return {
+        "side":         "BUY",
+        "price":        entry_price,
+        "stop_price":   stop_price,
+        "tp_price":     tp_price,
+        "risk_per_unit": risk,
+        "rr_target":    RR_TARGET,
+        "atr":          float(s_atr),
+        "score":        score,
+        "strategy":     "ema_pullback_long",
+        "confirm_m15":  (
+            f"EMA20 pullback at {s_ema20:.4f} | "
+            f"body={body_ratio:.2f} | "
+            f"vol={s_vol/s_avg_vol:.1f}x | "
+            f"rsi={s_rsi:.1f} | "
+            f"spread={spread_atr:.2f}atr | "
+            f"confirm close={c_close:.4f}"
+        ),
+        "breakout_time": timestamp,
+    }

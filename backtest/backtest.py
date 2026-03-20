@@ -1,8 +1,8 @@
-"""Backtest — Order Block + Break of Structure strategy.
+"""Backtest — EMA Pullback momentum strategy.
 
 Downloads historical Binance Futures klines, runs evaluate_signal candle-by-candle
-for M15 / 1H / 4H across the top 50 USDT-M pairs, calculates metrics, and sends
-a Telegram report.
+for M15 / 1H / 4H across the top 50 USDT-M pairs, calculates metrics, and saves
+two CSV files: one with individual trades and one with aggregated analysis.
 
 Usage (from repo root):
     python backtest/backtest.py
@@ -13,10 +13,7 @@ import csv
 import os
 import sys
 import time
-from datetime import datetime, timezone
-from urllib.error import HTTPError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from datetime import datetime
 
 import pandas as pd
 from binance import Client
@@ -27,10 +24,10 @@ from strategy import evaluate_signal  # noqa: E402
 
 # ── configuration ─────────────────────────────────────────────────────────────
 BACKTEST_DAYS = 30
-TOP_SYMBOLS = 50
+TOP_SYMBOLS = 999
 INTERVALS = ["15m", "1h", "4h"]
 CANDLES_PER_INTERVAL: dict[str, int] = {"15m": 1500, "1h": 720, "4h": 500}
-INITIAL_CAPITAL = 100.0
+INITIAL_CAPITAL = 500.0
 MARGIN_PER_TRADE = 5.0
 LEVERAGE = 10
 COMMISSION_PCT = 0.0004   # 0.04 % per side (taker)
@@ -75,31 +72,6 @@ def _load_env() -> dict[str, str]:
     return env
 
 
-def _send_telegram(token: str, chat_id: str, message: str) -> None:
-    if not token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = urlencode({"chat_id": chat_id, "text": message})
-    for attempt in range(1, 4):
-        try:
-            req = Request(
-                url,
-                data=payload.encode("utf-8"),
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                method="POST",
-            )
-            with urlopen(req, timeout=15):
-                return
-        except HTTPError as exc:
-            if exc.code == 429:
-                time.sleep(5)
-            elif attempt < 3:
-                time.sleep(attempt * 2.0)
-        except Exception:
-            if attempt < 3:
-                time.sleep(attempt * 2.0)
-
-
 def _load_symbols(client: Client) -> list[str]:
     """Return top TOP_SYMBOLS USDT-M perpetual symbols by 24h quote volume."""
     try:
@@ -139,7 +111,20 @@ def _load_symbols(client: Client) -> list[str]:
 
 def _fetch_klines(client: Client, symbol: str, interval: str, limit: int) -> pd.DataFrame:
     """Download klines and return a clean DataFrame."""
-    klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    max_retries = 3
+    klines = None
+    for attempt in range(max_retries):
+        try:
+            klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+            time.sleep(0.3)  # pausa entre requests exitosas
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)  # 5s, 10s, 15s
+                print(f"  [RETRY {attempt+1}/{max_retries}] {symbol} {interval}: esperando {wait}s...")
+                time.sleep(wait)
+            else:
+                raise e
     rows = [
         {
             "open_time": int(k[0]),
@@ -158,9 +143,54 @@ def _fetch_klines(client: Client, symbol: str, interval: str, limit: int) -> pd.
     return df
 
 
-def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> list[dict]:
-    """Walk through df candle-by-candle and simulate every signal."""
+# ── local indicator helpers (for extra CSV fields) ────────────────────────────
+
+def _ema_col(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _atr_col(df: pd.DataFrame, period: int) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def _rsi_col(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+# ── simulation ────────────────────────────────────────────────────────────────
+
+def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list[dict], int, int]:
+    """Walk through df candle-by-candle and simulate every signal.
+
+    Returns (trades, skipped_4h_sell, skipped_low_score).
+    """
+    # Precompute indicators once for extra CSV fields
+    ema20  = _ema_col(df["close"], 20)
+    ema50  = _ema_col(df["close"], 50)
+    ema200 = _ema_col(df["close"], 200)
+    atr    = _atr_col(df, ATR_PERIOD)
+    avg_vol = df["volume"].rolling(20).mean()
+    rsi    = _rsi_col(df["close"], 14)
+
     trades: list[dict] = []
+    skipped_4h_sell = 0
+    skipped_low_score = 0
     i = 230  # minimum candles needed for EMA200
     n = len(df)
 
@@ -176,57 +206,92 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> list[dict]
             i += 1
             continue
 
+        # Mirror production filters exactly
+        if interval == "4h" and signal.get("side") == "SELL":
+            skipped_4h_sell += 1
+            i += 1
+            continue
+
+        if float(signal.get("score") or 0) < 1.0:
+            skipped_low_score += 1
+            i += 1
+            continue
+
         entry_price = float(signal["price"])
-        stop_price = float(signal["stop_price"])
-        tp_price = float(signal["tp_price"])
-        side = signal["side"]
+        stop_price  = float(signal["stop_price"])
+        tp_price    = float(signal["tp_price"])
+        side  = signal["side"]
         score = float(signal.get("score") or 0.0)
 
         if entry_price <= 0 or stop_price <= 0 or tp_price <= 0:
             i += 1
             continue
 
-        qty = (MARGIN_PER_TRADE * LEVERAGE) / entry_price
+        # ── extra fields from precomputed indicators ──────────────────────────
+        # Signal candle = sub.iloc[-2] = df.iloc[i-1]
+        sig_idx = i - 1
+        def _safe(series: pd.Series, idx: int) -> float:
+            v = series.iloc[idx]
+            return float(v) if not pd.isna(v) else 0.0
+
+        e20     = _safe(ema20,   sig_idx)
+        e50     = _safe(ema50,   sig_idx)
+        e200    = _safe(ema200,  sig_idx)
+        atr_sig = _safe(atr,     sig_idx)
+        avv_sig = _safe(avg_vol, sig_idx)
+        rsi_sig = _safe(rsi,     sig_idx)
+
+        sig_row = df.iloc[sig_idx]
+        s_high  = float(sig_row["high"])
+        s_low   = float(sig_row["low"])
+        s_open  = float(sig_row["open"])
+        s_close = float(sig_row["close"])
+        s_vol   = float(sig_row["volume"])
+
+        rng          = s_high - s_low
+        body         = abs(s_close - s_open)
+        body_ratio   = body / rng if rng > 0 else 0.0
+        vol_ratio    = s_vol / avv_sig if avv_sig > 0 else 0.0
+        ema_spread   = (e20 - e50) / atr_sig if atr_sig > 0 else 0.0
+        dist_tp      = abs(tp_price - entry_price)
+        dist_sl      = abs(entry_price - stop_price)
+        rr_planned   = dist_tp / dist_sl if dist_sl > 0 else 0.0
+
+        if e20 > e50 and e50 > e200:
+            market_phase = "UPTREND"
+        elif e20 < e50 and e50 < e200:
+            market_phase = "DOWNTREND"
+        else:
+            market_phase = "MIXED"
+
+        qty        = (MARGIN_PER_TRADE * LEVERAGE) / entry_price
         commission = qty * entry_price * COMMISSION_PCT * 2
 
         # Simulate: scan next candles for SL/TP hit
-        result = "TIMEOUT"
-        exit_price = float(df.iloc[min(i + MAX_CANDLES_HOLD, n - 1)]["close"])
+        result      = "TIMEOUT"
+        exit_price  = float(df.iloc[min(i + MAX_CANDLES_HOLD, n - 1)]["close"])
         candles_held = 0
 
         for j in range(i + 1, min(i + MAX_CANDLES_HOLD + 1, n)):
             candle = df.iloc[j]
             candles_held = j - i
             c_high = float(candle["high"])
-            c_low = float(candle["low"])
+            c_low  = float(candle["low"])
 
             if side == "BUY":
                 if c_high >= tp_price and c_low <= stop_price:
-                    # Both hit same candle — assume worst case: SL hit first
-                    result = "LOSS"
-                    exit_price = stop_price
-                    break
+                    result = "LOSS"; exit_price = stop_price; break
                 if c_high >= tp_price:
-                    result = "WIN"
-                    exit_price = tp_price
-                    break
+                    result = "WIN"; exit_price = tp_price; break
                 if c_low <= stop_price:
-                    result = "LOSS"
-                    exit_price = stop_price
-                    break
+                    result = "LOSS"; exit_price = stop_price; break
             else:  # SELL
                 if c_low <= tp_price and c_high >= stop_price:
-                    result = "LOSS"
-                    exit_price = stop_price
-                    break
+                    result = "LOSS"; exit_price = stop_price; break
                 if c_low <= tp_price:
-                    result = "WIN"
-                    exit_price = tp_price
-                    break
+                    result = "WIN"; exit_price = tp_price; break
                 if c_high >= stop_price:
-                    result = "LOSS"
-                    exit_price = stop_price
-                    break
+                    result = "LOSS"; exit_price = stop_price; break
 
         if side == "BUY":
             gross_pnl = (exit_price - entry_price) * qty
@@ -235,121 +300,115 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> list[dict]
         pnl_usdt = gross_pnl - commission
 
         trades.append({
-            "symbol": symbol,
-            "interval": interval,
-            "side": side,
-            "entry_price": round(entry_price, 8),
-            "exit_price": round(exit_price, 8),
-            "stop_price": round(stop_price, 8),
-            "tp_price": round(tp_price, 8),
-            "pnl_usdt": round(pnl_usdt, 4),
-            "result": result,
-            "candles_held": candles_held,
-            "score": score,
+            "symbol":        symbol,
+            "interval":      interval,
+            "side":          side,
+            "entry_price":   round(entry_price, 8),
+            "exit_price":    round(exit_price, 8),
+            "stop_price":    round(stop_price, 8),
+            "tp_price":      round(tp_price, 8),
+            "pnl_usdt":      round(pnl_usdt, 4),
+            "result":        result,
+            "candles_held":  candles_held,
+            "score":         score,
             "signal_candle": i,
+            # Extra fields
+            "ema_spread":       round(ema_spread, 4),
+            "rsi_at_signal":    round(rsi_sig, 2),
+            "vol_ratio":        round(vol_ratio, 3),
+            "body_ratio":       round(body_ratio, 3),
+            "distance_to_tp":   round(dist_tp, 8),
+            "distance_to_sl":   round(dist_sl, 8),
+            "rr_planned":       round(rr_planned, 3),
+            "market_phase":     market_phase,
         })
 
         i += SKIP_AFTER_SIGNAL
 
-    return trades
+    return trades, skipped_4h_sell, skipped_low_score
 
 
-def _max_consecutive_losses(trades: list[dict]) -> int:
-    max_streak = cur = 0
+# ── stats helpers ─────────────────────────────────────────────────────────────
+
+def _compute_stats(trades: list[dict]) -> dict:
+    """Return aggregated statistics for a list of trades."""
+    if not trades:
+        return {
+            "total": 0, "wins": 0, "losses": 0, "timeouts": 0,
+            "winrate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
+            "avg_win": 0.0, "avg_loss": 0.0, "rr_real": 0.0,
+        }
+    wins    = [t for t in trades if t["result"] == "WIN"]
+    losses  = [t for t in trades if t["result"] == "LOSS"]
+    timeouts = [t for t in trades if t["result"] == "TIMEOUT"]
+    total   = len(trades)
+    total_pnl = sum(t["pnl_usdt"] for t in trades)
+    avg_pnl   = total_pnl / total
+    avg_win   = sum(t["pnl_usdt"] for t in wins)   / len(wins)   if wins   else 0.0
+    avg_loss  = sum(t["pnl_usdt"] for t in losses) / len(losses) if losses else 0.0
+    rr_real   = avg_win / abs(avg_loss) if losses and avg_loss != 0 else 0.0
+    return {
+        "total":     total,
+        "wins":      len(wins),
+        "losses":    len(losses),
+        "timeouts":  len(timeouts),
+        "winrate":   len(wins) / total * 100,
+        "total_pnl": total_pnl,
+        "avg_pnl":   avg_pnl,
+        "avg_win":   avg_win,
+        "avg_loss":  avg_loss,
+        "rr_real":   rr_real,
+    }
+
+
+def _score_range(t: dict) -> str:
+    s = float(t["score"])
+    if s < 1: return "0-1"
+    if s < 2: return "1-2"
+    if s < 3: return "2-3"
+    if s < 4: return "3-4"
+    return "4+"
+
+
+def _hold_range(t: dict) -> str:
+    h = int(t["candles_held"])
+    if h <= 5:  return "0-5"
+    if h <= 10: return "5-10"
+    if h <= 20: return "10-20"
+    if h <= 35: return "20-35"
+    return "35+"
+
+
+def _vol_range(t: dict) -> str:
+    v = float(t.get("vol_ratio", 0))
+    if v < 1.5: return "<1.5"
+    if v < 2.0: return "1.5-2.0"
+    if v < 3.0: return "2.0-3.0"
+    return ">3.0"
+
+
+def _rsi_range(t: dict) -> str:
+    r = float(t.get("rsi_at_signal", 0))
+    if r < 40: return "<40"
+    if r < 50: return "40-50"
+    if r < 60: return "50-60"
+    return ">60"
+
+
+def _group_by(trades: list[dict], key_fn) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
     for t in trades:
-        if t["result"] == "LOSS":
-            cur += 1
-            max_streak = max(max_streak, cur)
-        else:
-            cur = 0
-    return max_streak
+        k = key_fn(t)
+        groups.setdefault(k, []).append(t)
+    return groups
 
 
-def _build_report(
-    all_trades: list[dict],
-    date_from: datetime,
-    date_to: datetime,
-    n_symbols: int,
-) -> str:
-    sep = "━━━━━━━━━━━━━━━━━━"
-    lines: list[str] = [
-        f"📊 BACKTEST REPORT — {BACKTEST_DAYS} días",
-        f"Período: {date_from.strftime('%Y-%m-%d')} a {date_to.strftime('%Y-%m-%d')}",
-        f"Símbolos analizados: {n_symbols}",
-        sep,
-    ]
-
-    total_pnl = 0.0
-    total_wins = total_losses = total_timeouts = total_count = 0
-
-    for iv in INTERVALS:
-        iv_trades = [t for t in all_trades if t["interval"] == iv]
-        if not iv_trades:
-            lines.append(f"⏱ {iv.upper()}: 0 trades")
-            continue
-        wins = sum(1 for t in iv_trades if t["result"] == "WIN")
-        losses = sum(1 for t in iv_trades if t["result"] == "LOSS")
-        timeouts = sum(1 for t in iv_trades if t["result"] == "TIMEOUT")
-        cnt = len(iv_trades)
-        wr = wins / cnt * 100 if cnt else 0.0
-        pnl = sum(t["pnl_usdt"] for t in iv_trades)
-        sign = "+" if pnl >= 0 else ""
-        lines.append(
-            f"⏱ {iv.upper()}: {cnt} trades | WR: {wr:.1f}% | PnL: {sign}${pnl:.2f}"
-        )
-        total_pnl += pnl
-        total_wins += wins
-        total_losses += losses
-        total_timeouts += timeouts
-        total_count += cnt
-
-    lines.append(sep)
-
-    sign = "+" if total_pnl >= 0 else ""
-    lines += [
-        f"✅ Total trades: {total_count}",
-        f"✅ Ganados: {total_wins} | Perdidos: {total_losses} | Timeout: {total_timeouts}",
-        f"✅ PnL Total: {sign}${total_pnl:.2f}",
-    ]
-
-    # Best / worst symbol
-    sym_pnl: dict[str, float] = {}
-    for t in all_trades:
-        sym_pnl[t["symbol"]] = sym_pnl.get(t["symbol"], 0.0) + t["pnl_usdt"]
-
-    if sym_pnl:
-        best_sym = max(sym_pnl, key=sym_pnl.get)  # type: ignore[arg-type]
-        worst_sym = min(sym_pnl, key=sym_pnl.get)  # type: ignore[arg-type]
-        best_sign = "+" if sym_pnl[best_sym] >= 0 else ""
-        worst_sign = "+" if sym_pnl[worst_sym] >= 0 else ""
-        lines.append(f"📈 Mejor par: {best_sym} ({best_sign}${sym_pnl[best_sym]:.2f})")
-        lines.append(f"📉 Peor par: {worst_sym} ({worst_sign}${sym_pnl[worst_sym]:.2f})")
-
-    max_losses = _max_consecutive_losses(all_trades)
-    lines.append(f"🔴 Racha pérdidas: {max_losses} consecutivas")
-    lines.append(sep)
-
-    capital_final = INITIAL_CAPITAL + total_pnl
-    roi = (total_pnl / INITIAL_CAPITAL) * 100
-    roi_sign = "+" if roi >= 0 else ""
-    lines += [
-        f"Capital inicial: ${INITIAL_CAPITAL:.0f}",
-        f"Capital final: ${capital_final:.2f}",
-        f"ROI: {roi_sign}{roi:.2f}%",
-    ]
-
-    if total_pnl > 0:
-        lines.append("✅ ESTRATEGIA RENTABLE")
-    else:
-        lines.append("❌ ESTRATEGIA NO RENTABLE — revisar parámetros")
-
-    return "\n".join(lines)
-
+# ── CSV output ────────────────────────────────────────────────────────────────
 
 def _save_csv(all_trades: list[dict]) -> str:
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
     os.makedirs(results_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(results_dir, f"backtest_{ts}.csv")
     if not all_trades:
         return path
@@ -361,14 +420,165 @@ def _save_csv(all_trades: list[dict]) -> str:
     return path
 
 
+def _save_analysis_csv(all_trades: list[dict]) -> str:
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(results_dir, f"analysis_{ts}.csv")
+
+    fieldnames = [
+        "categoria", "valor", "total_trades", "wins", "losses", "timeouts",
+        "winrate", "total_pnl", "avg_pnl", "avg_win", "avg_loss", "rr_real",
+    ]
+
+    def _rows_for(categoria: str, groups: dict[str, list[dict]]) -> list[dict]:
+        rows = []
+        for valor, trades in sorted(groups.items()):
+            s = _compute_stats(trades)
+            rows.append({
+                "categoria":    categoria,
+                "valor":        valor,
+                "total_trades": s["total"],
+                "wins":         s["wins"],
+                "losses":       s["losses"],
+                "timeouts":     s["timeouts"],
+                "winrate":      round(s["winrate"], 2),
+                "total_pnl":    round(s["total_pnl"], 4),
+                "avg_pnl":      round(s["avg_pnl"], 4),
+                "avg_win":      round(s["avg_win"], 4),
+                "avg_loss":     round(s["avg_loss"], 4),
+                "rr_real":      round(s["rr_real"], 3),
+            })
+        return rows
+
+    all_rows: list[dict] = []
+    all_rows += _rows_for("interval_side",
+                          _group_by(all_trades, lambda t: f"{t['interval']}_{t['side']}"))
+    all_rows += _rows_for("score_range",
+                          _group_by(all_trades, _score_range))
+    all_rows += _rows_for("candles_held",
+                          _group_by(all_trades, _hold_range))
+    all_rows += _rows_for("market_phase",
+                          _group_by(all_trades, lambda t: str(t.get("market_phase", "MIXED"))))
+    all_rows += _rows_for("vol_ratio",
+                          _group_by(all_trades, _vol_range))
+    all_rows += _rows_for("rsi_at_signal",
+                          _group_by(all_trades, _rsi_range))
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+    return path
+
+
+# ── console report ────────────────────────────────────────────────────────────
+
+def _print_report(
+    all_trades: list[dict],
+    skipped_4h_sell: int,
+    skipped_low_score: int,
+    csv_path: str,
+    analysis_path: str,
+) -> None:
+    SEP = "=" * 60
+
+    def _usd(v: float) -> str:
+        return f"+${v:.2f}" if v >= 0 else f"-${abs(v):.2f}"
+
+    def _section(title: str) -> None:
+        print(f"\n{SEP}")
+        print(f"  {title}")
+        print(SEP)
+
+    def _print_group(groups: dict[str, list[dict]], order: list[str] | None = None) -> None:
+        keys = order if order else sorted(groups.keys())
+        for k in keys:
+            if k not in groups:
+                continue
+            s = _compute_stats(groups[k])
+            print(
+                f"  {k:<20} | {s['total']:>5} trades | "
+                f"WR: {s['winrate']:>5.1f}% | "
+                f"PnL: {_usd(s['total_pnl'])}"
+            )
+
+    # ── Section 1: General summary ────────────────────────────────────────────
+    _section("1. RESUMEN GENERAL")
+    g = _compute_stats(all_trades)
+    if g["total"] == 0:
+        print("  Sin trades.")
+    else:
+        be_wr = 1 / (1 + g["rr_real"]) * 100 if g["rr_real"] > 0 else 0.0
+        print(f"  Total trades : {g['total']}")
+        print(f"  Wins / Losses / Timeouts : {g['wins']} / {g['losses']} / {g['timeouts']}")
+        print(f"  Winrate      : {g['winrate']:.2f}%")
+        print(f"  PnL total    : {_usd(g['total_pnl'])}")
+        print(f"  Avg PnL      : {_usd(g['avg_pnl'])}")
+        print(f"  Avg WIN      : {_usd(g['avg_win'])}")
+        print(f"  Avg LOSS     : {_usd(g['avg_loss'])}")
+        print(f"  RR real      : {g['rr_real']:.2f}")
+        print(f"  WR breakeven : {be_wr:.1f}%")
+
+    # ── Section 2: By timeframe + side ───────────────────────────────────────
+    _section("2. POR TIMEFRAME Y SIDE")
+    tf_side = _group_by(all_trades, lambda t: f"{t['interval']} {t['side']}")
+    order2 = ["15m BUY", "15m SELL", "1h BUY", "1h SELL", "4h BUY", "4h SELL"]
+    _print_group(tf_side, order2)
+
+    # ── Section 3: By score range ─────────────────────────────────────────────
+    _section("3. POR SCORE")
+    _print_group(_group_by(all_trades, _score_range), ["0-1", "1-2", "2-3", "3-4", "4+"])
+
+    # ── Section 4: By candles held ────────────────────────────────────────────
+    _section("4. POR DURACION (candles held)")
+    _print_group(_group_by(all_trades, _hold_range), ["0-5", "5-10", "10-20", "20-35", "35+"])
+
+    # ── Section 5: By market phase ────────────────────────────────────────────
+    _section("5. POR MARKET PHASE")
+    _print_group(_group_by(all_trades, lambda t: str(t.get("market_phase", "MIXED"))),
+                 ["UPTREND", "DOWNTREND", "MIXED"])
+
+    # ── Section 6: By vol_ratio ───────────────────────────────────────────────
+    _section("6. POR VOLUMEN (vol_ratio)")
+    _print_group(_group_by(all_trades, _vol_range), ["<1.5", "1.5-2.0", "2.0-3.0", ">3.0"])
+
+    # ── Section 7: By RSI ─────────────────────────────────────────────────────
+    _section("7. POR RSI EN SEÑAL")
+    _print_group(_group_by(all_trades, _rsi_range), ["<40", "40-50", "50-60", ">60"])
+
+    # ── Section 8: Top 5 best / worst symbols ────────────────────────────────
+    _section("8. TOP 5 MEJORES Y PEORES PARES")
+    sym_groups = _group_by(all_trades, lambda t: t["symbol"])
+    sym_stats = {sym: _compute_stats(ts) for sym, ts in sym_groups.items()}
+    by_pnl = sorted(sym_stats.items(), key=lambda x: x[1]["total_pnl"], reverse=True)
+
+    print("  MEJORES:")
+    for sym, s in by_pnl[:5]:
+        print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | PnL: {_usd(s['total_pnl'])}")
+
+    print("  PEORES:")
+    for sym, s in by_pnl[-5:]:
+        print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | PnL: {_usd(s['total_pnl'])}")
+
+    # ── Section 9: Discarded trades ───────────────────────────────────────────
+    _section("9. TRADES DESCARTADOS")
+    print(f"  4H SELL filtrados  : {skipped_4h_sell}")
+    print(f"  Score < 1.0        : {skipped_low_score}")
+
+    # ── Section 10: Files generated ───────────────────────────────────────────
+    _section("10. ARCHIVOS GENERADOS")
+    print(f"  Trades CSV   : {csv_path}")
+    print(f"  Analysis CSV : {analysis_path}")
+    print()
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     env = _load_env()
-    api_key = env.get("BINANCE_API_KEY", "")
+    api_key    = env.get("BINANCE_API_KEY", "")
     api_secret = env.get("BINANCE_API_SECRET", "")
-    tg_token = env.get("TELEGRAM_BOT_TOKEN", "")
-    tg_chat = env.get("TELEGRAM_CHAT_ID", "")
 
     client = Client(api_key, api_secret)
 
@@ -379,13 +589,14 @@ def main() -> None:
         return
     print(f"Símbolos seleccionados: {len(symbols)}")
 
-    date_to = datetime.now(timezone.utc)
-
     all_trades: list[dict] = []
+    total_skipped_4h_sell  = 0
+    total_skipped_low_score = 0
     total_tasks = len(symbols) * len(INTERVALS)
     task_num = 0
 
     for sym in symbols:
+        time.sleep(0.1)  # pausa entre símbolos para no saturar la API
         for interval in INTERVALS:
             task_num += 1
             limit = CANDLES_PER_INTERVAL[interval]
@@ -401,34 +612,22 @@ def main() -> None:
                 print(f"  [SKIP] {sym} {interval}: datos insuficientes ({len(df)} velas)")
                 continue
 
-            trades = _simulate_trades(df, sym, interval)
+            trades, s4h, ssc = _simulate_trades(df, sym, interval)
             all_trades.extend(trades)
+            total_skipped_4h_sell  += s4h
+            total_skipped_low_score += ssc
             print(f"  → {len(trades)} señales")
 
-    date_from = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    csv_path      = _save_csv(all_trades)
+    analysis_path = _save_analysis_csv(all_trades)
+
+    _print_report(
+        all_trades,
+        total_skipped_4h_sell,
+        total_skipped_low_score,
+        csv_path,
+        analysis_path,
     )
-    date_from_ts = date_to.timestamp() - (BACKTEST_DAYS * 86400)
-    date_from = datetime.fromtimestamp(date_from_ts, tz=timezone.utc)
-
-    report = _build_report(all_trades, date_from, date_to, len(symbols))
-
-    print("\n" + "=" * 50)
-    print(report)
-    print("=" * 50 + "\n")
-
-    if tg_token and tg_chat:
-        print("Enviando reporte por Telegram...")
-        try:
-            _send_telegram(tg_token, tg_chat, report)
-            print("Reporte enviado.")
-        except Exception as exc:
-            print(f"[WARN] Telegram falló: {exc}")
-    else:
-        print("[INFO] TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID no configurados — solo consola.")
-
-    csv_path = _save_csv(all_trades)
-    print(f"Resultados guardados en: {csv_path}")
 
 
 if __name__ == "__main__":

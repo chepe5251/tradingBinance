@@ -1,7 +1,7 @@
 # Binance Futures Scalping Bot
 
 > Algorithmic trading bot for **Binance USDT-M Perpetual Futures**.
-> Scans 529+ pairs in real time, detects high-probability **Order Block + Break of Structure** setups on M15, and executes one position at a time with automatic TP/SL protection, trailing stop, and loss-based scaling.
+> Scans all USDT-M perpetual pairs in real time, detects high-probability **EMA Pullback Long-Only** setups on M15/1H/4H, and executes one position at a time with automatic TP/SL protection, trailing stop, and loss-based scaling.
 
 ---
 
@@ -33,8 +33,8 @@
 
 | Feature | Detail |
 |---|---|
-| Symbol universe | All 529+ USDT-M perpetual pairs loaded at startup |
-| Signal timeframe | M15 with 1H trend alignment |
+| Symbol universe | All USDT-M perpetual pairs loaded at startup |
+| Signal timeframes | M15, 1H, 4H (long-only) |
 | Entry | Limit order with automatic market fallback after 6 s |
 | Protection | Mandatory TP + SL with auto-recovery if orders disappear |
 | Breakeven | SL moved to entry once +0.5 % profit is reached |
@@ -49,65 +49,45 @@
 
 ## Strategy
 
-### Order Block + Break of Structure (OB+BOS) — M15
+### EMA Pullback Long-Only — M15 / 1H / 4H
 
-The bot detects **institutional order blocks** by finding a Break of Structure (BOS) — a strong directional candle that breaks a key 20-bar level — then waits for price to **return to the origin zone** of that move. Entry is anticipatory: the bot enters at the institutional zone, not after the move has already happened.
+Detects high-probability pullback entries by waiting for price to retrace to EMA20 within a well-aligned EMA20/50/200 uptrend, then requiring a bullish rejection candle followed by a break-of-high confirmation candle.
 
----
-
-#### Concept
-
-```
-       BOS impulse candle
-       ┌──────────────────►  price breaks structure high
-       │
-[OB candle] ◄── last bearish candle before the BOS
-       │         this zone is where institutional buys were placed
-       │
-       └──────────────────►  price returns to OB zone → ENTRY
-```
+**Long-only.** Shorts were removed after backtesting showed 35.5% WR and negative net PnL across all timeframes.
 
 ---
 
-#### LONG Setup — all conditions must pass in order
+#### Entry Logic — all 9 conditions must pass in order
 
 | # | Condition | Detail |
 |---|-----------|--------|
-| 1 | **Strong uptrend** | `close > EMA200` AND `EMA50 > EMA200` |
-| 2 | **BOS detected** | A candle broke above `highest_high_20` with `body ≥ 60%` of range and `volume ≥ 1.5× avg` |
-| 3 | **Order Block identified** | Last bearish candle immediately before the BOS impulse candle |
-| 4 | **Price returned to OB** | Current candle `low` is inside OB zone (`ob_low ≤ low ≤ ob_high`) |
-| 5 | **OB not violated** | No candle between BOS and now closed below `ob_low` |
-| 6 | **Rejection wick** | `lower_wick / range ≥ 0.40` — absorption at the zone |
-| 7 | **Volume confirmation** | Current candle `volume ≥ 1.2× avg_vol_20` |
-| 8 | **OB not expired** | BOS occurred within last `MAX_OB_AGE = 10` candles |
-
-#### SHORT Setup
-
-Exact mirror:
-- `close < EMA200` AND `EMA50 < EMA200`
-- BOS: strong bearish candle breaks `lowest_low_20`
-- Order Block: last bullish candle before the BOS
-- Price returns to OB: current `high` inside OB zone
-- OB not violated: no close **above** `ob_high` since BOS
-- `upper_wick / range ≥ 0.40`
+| 1 | **Structural uptrend** | `EMA20 > EMA50 > EMA200` |
+| 2 | **Minimum EMA separation** | `EMA20 − EMA50 ≥ 0.15 × ATR` — filters flat/ranging markets |
+| 3 | **Not overextended** | `EMA20 − EMA50 ≤ 1.0 × ATR` — pullbacks don't bounce when trend is stretched |
+| 4 | **Price pulled back to EMA20** | Signal candle `low` within ±0.8 ATR of EMA20 |
+| 5 | **Structure intact** | Signal candle `close > EMA50` |
+| 6 | **RSI healthy pullback zone** | `48 ≤ RSI ≤ 68` — not weak, not overbought |
+| 7 | **Bullish rejection candle** | `body_ratio ≥ 0.35`, `close > open`, close in upper third of range |
+| 8 | **Volume in optimal range** | `1.05× ≤ vol ≤ 1.5× avg` — confirms interest, excludes exhaustion spikes |
+| 9 | **Confirmation candle** | Next candle closes above signal candle high |
 
 #### Levels
 
 ```
-Entry      = close of the rejection candle (current bar)
-SL (LONG)  = ob_low − 0.1 × ATR
-SL (SHORT) = ob_high + 0.1 × ATR
-TP         = entry ± (risk × 2.5)   ← RR 2.5:1
+Entry  = close of confirmation candle
+SL     = signal candle low − 0.1 × ATR
+TP     = entry + (risk × 2.0)   ← RR 2:1
 ```
 
-#### Signal Score (max ~6.0)
+#### Signal Score (max ~4.0)
 
 | Component | Formula | Max |
 |-----------|---------|-----|
-| Wick quality | `(wick_ratio − 0.40) / 0.60 × 3` | 3.0 |
-| Volume strength | `vol / avg_vol − 1.2` | 2.0 |
-| OB freshness | `(10 − ob_age) / 10` — newer BOS scores higher | 1.0 |
+| Body quality | `((body_ratio − 0.35) / 0.65) × 2` | 2.0 |
+| RSI sweet spot | `+1.0` if RSI in 53–63, else 0 | 1.0 |
+| EMA spread strength | `(spread_atr − 0.15) × 2`, capped at 1.0 | 1.0 |
+
+Minimum score to fire a signal: **1.5**
 
 ---
 
@@ -115,13 +95,19 @@ TP         = entry ± (risk × 2.5)   ← RR 2.5:1
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `BOS_LOOKBACK` | 20 | Bars used to define the prior structure high/low |
-| `BOS_BODY_RATIO` | 0.60 | Min body-to-range ratio for a valid BOS candle |
-| `BOS_VOL_MULT` | 1.5 | Min volume multiplier for BOS candle |
-| `OB_WICK_RATIO` | 0.40 | Min rejection wick at the Order Block |
-| `OB_VOL_MULT` | 1.2 | Min volume at the rejection candle |
-| `MAX_OB_AGE` | 10 | Max candles since BOS before the OB expires |
-| `RR_TARGET` | 2.5 | Risk:Reward ratio |
+| `EMA_FAST` | 20 | Fast EMA for pullback zone |
+| `EMA_MID` | 50 | Mid EMA for structure |
+| `EMA_SLOW` | 200 | Trend filter |
+| `PULLBACK_TOLERANCE_ATR` | 0.8 | Tolerance band around EMA20 for pullback detection |
+| `MIN_EMA_SPREAD_ATR` | 0.15 | Minimum EMA20−EMA50 spread (filters ranging) |
+| `MAX_EMA_SPREAD_ATR` | 1.0 | Maximum spread (filters overextended trends) |
+| `MIN_BODY_RATIO` | 0.35 | Minimum rejection candle body quality |
+| `MIN_VOL_MULT` | 1.05 | Minimum volume vs 20-bar average |
+| `MAX_VOL_MULT` | 1.5 | Maximum volume (excludes exhaustion spikes) |
+| `RSI_LONG_MIN` | 48.0 | Lower RSI bound |
+| `RSI_LONG_MAX` | 68.0 | Upper RSI bound |
+| `RR_TARGET` | 2.0 | Risk:Reward ratio |
+| `MIN_SCORE` | 1.5 | Minimum score to emit a signal |
 
 ---
 
@@ -248,7 +234,7 @@ See [`.env.example`](.env.example) for the full list of available options.
 | `MARGIN_UTILIZATION` | `0.95` | Fraction of balance available as margin |
 | `SCALE_LEVEL1_MARGIN_USDT` | `5.0` | Extra margin added at first scale level |
 | `USE_PAPER_TRADING` | `false` | Full simulation mode |
-| `SYMBOLS` | *(all)* | Comma-separated symbol filter (empty = all 529+) |
+| `SYMBOLS` | *(all)* | Comma-separated symbol filter (empty = all USDT-M perpetuals) |
 
 All defaults are defined in [`config.py`](config.py). Settings are validated and bounded at startup.
 
@@ -274,19 +260,19 @@ To stop the bot, press `Ctrl+C`. Open TP/SL orders remain active on the exchange
 ## Trade Lifecycle
 
 ```
-M15 candle closes
+M15 / 1H / 4H candle closes
         │
         ▼
-evaluate_signal() ── all 7 filters pass? ──► signal candidate
+evaluate_signal() ── all 9 conditions pass? ──► signal candidate
         │
         ▼
-_layered_signal_check() ── 5 validation layers pass?
+  score ≥ 1.5? AND side == BUY?
         │                       │
         │ NO                    │ YES
         ▼                       ▼
-  log filter reason       signal accepted
-  (trades.log)                  │
-                                ▼ (all accepted signals sorted by score)
+  return None             signal accepted
+                                │
+                                ▼ (signals sorted by score)
 RiskManager.can_trade()  AND  no open position?
         │
         ├─ NO  ──► broadcast signal to Telegram, skip execution
@@ -354,7 +340,7 @@ All counters reset at UTC midnight.
 
 When `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set, the bot sends:
 
-- **Signal alert** — for every valid setup detected across all 529+ symbols, including entry, SL, TP, R:R, and quality rating.
+- **Signal alert** — for every valid setup detected across all USDT-M pairs, including entry, SL, TP, R:R, score, and EMA/RSI details.
 - **Trade opened** — confirmation with fill price and execution type (MAKER / TAKER).
 - **Breakeven activated** — when SL is moved to entry.
 - **Trailing stop updated** — each time the trail advances.
@@ -382,14 +368,15 @@ tail -f logs/trades.log
 ## Project Structure
 
 ```
-main.py          Application entry point and orchestration loop (1 300+ lines)
-strategy.py      Order Block + Break of Structure signal engine
-execution.py     Order routing, rounding, OCO monitor, trailing stop (725 lines)
-data_stream.py   WebSocket kline multiplexer with auto-restart (350 lines)
-risk.py          RiskManager: cooldown, loss pause, drawdown guard (124 lines)
-config.py        Settings dataclass and .env loader (259 lines)
-indicators.py    Shared EMA / ATR helpers (47 lines)
-test_trade.py    Manual order validation script (82 lines)
+main.py          Application entry point and orchestration loop
+strategy.py      EMA Pullback Long-Only signal engine (backtest-optimized)
+execution.py     Order routing, rounding, OCO monitor, trailing stop
+data_stream.py   WebSocket kline multiplexer with auto-restart
+risk.py          RiskManager: cooldown, loss pause, drawdown guard
+config.py        Settings dataclass and .env loader
+indicators.py    Shared EMA / ATR helpers
+test_trade.py    Manual order validation script
+backtest/        Candle-by-candle backtester across all USDT-M pairs
 ```
 
 ---

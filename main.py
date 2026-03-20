@@ -678,6 +678,9 @@ def main() -> None:
                 if not signal:
                     continue
 
+                if interval == "4h" and signal.get("side") == "SELL":
+                    continue
+
                 signal["timeframe"] = interval.upper()
                 trades_logger.info(
                     "signal %s tf=%s side=%s confirm=%s breakout=%s",
