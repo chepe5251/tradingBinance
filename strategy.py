@@ -23,10 +23,10 @@ EMA_TREND_FAST = 50
 EMA_TREND_SLOW = 200
 SWEEP_LOOKBACK = 20
 VOL_LOOKBACK = 20
-MIN_WICK_RATIO = 0.55   # was 0.6  — accepts slightly less perfect wicks
-VOL_MULT = 1.2          # was 1.3  — accepts slightly lower volume
-MAX_RANGE_ATR = 2.5     # was 2.0  — accepts slightly larger sweep candles
-MIN_RISK_ATR = 0.4      # was 0.5  — accepts slightly smaller risk distance
+MIN_WICK_RATIO = 0.45   # lowered: accepts less perfect wicks
+VOL_MULT = 1.0          # lowered: accepts average-volume sweeps
+MAX_RANGE_ATR = 3.0     # raised: accepts larger sweep candles
+MIN_RISK_ATR = 0.3      # lowered: accepts tighter setups
 RR_TARGET = 2.0
 
 
@@ -168,7 +168,7 @@ def evaluate_signal(
     )
 
     # ── LONG ──────────────────────────────────────────────────────────────────
-    if s_close > ema200 and ema50 > ema200:               # 1. trend bullish
+    if s_close > ema200:                                   # 1. price above EMA200
         if s_low < lowest_20:                              # 2. bearish sweep
             if s_close > lowest_20:                        # 3. false breakout
                 lower_wick = min(s_open, s_close) - s_low
@@ -176,7 +176,7 @@ def evaluate_signal(
                 if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
                     if s_vol >= VOL_MULT * avg_vol:        # 5. volume
                         if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
-                            if c_high > s_high and c_close > s_close:  # 7. confirm
+                            if c_close > s_close:          # 7. confirm close
                                 stop_price = s_low
                                 risk = entry_price - stop_price
                                 if risk >= MIN_RISK_ATR * atr_val and risk > 0:
@@ -225,7 +225,7 @@ def evaluate_signal(
                                     }
 
     # ── SHORT ─────────────────────────────────────────────────────────────────
-    if s_close < ema200 and ema50 < ema200:               # 1. trend bearish
+    if s_close < ema200:                                   # 1. price below EMA200
         if s_high > highest_20:                            # 2. bullish sweep
             if s_close < highest_20:                       # 3. false breakout
                 upper_wick = s_high - max(s_open, s_close)
@@ -233,7 +233,7 @@ def evaluate_signal(
                 if wick_ratio >= MIN_WICK_RATIO:           # 4. absorption
                     if s_vol >= VOL_MULT * avg_vol:        # 5. volume
                         if sweep_range < MAX_RANGE_ATR * atr_val:   # 6. size
-                            if c_low < s_low and c_close < s_close:  # 7. confirm
+                            if c_close < s_close:          # 7. confirm close
                                 stop_price = s_high
                                 risk = stop_price - entry_price
                                 if risk >= MIN_RISK_ATR * atr_val and risk > 0:
