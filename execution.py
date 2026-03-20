@@ -6,8 +6,8 @@ rounding, symbol filters, and protection synchronization in one place.
 from __future__ import annotations
 
 import time
-from decimal import Decimal
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional
 
 from binance import Client

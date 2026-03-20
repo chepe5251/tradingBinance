@@ -21,9 +21,9 @@ from binance import Client
 
 from config import from_env
 from data_stream import MarketDataStream
-from strategy import evaluate_signal
-from risk import RiskManager
 from execution import FuturesExecutor
+from risk import RiskManager
+from strategy import evaluate_signal
 
 _TELEGRAM_SEND_LOCK = threading.Lock()
 _TELEGRAM_LAST_SEND_TS = 0.0
