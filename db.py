@@ -5,6 +5,7 @@ is safe to call from any thread without additional locking.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 
@@ -13,6 +14,7 @@ DB_PATH = "logs/trades.db"
 
 def init_db() -> None:
     """Create the trades table if it does not exist."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
