@@ -1,4 +1,4 @@
-"""EMA Pullback Long-Only signal engine — v4 (backtest-refined).
+"""EMA Pullback Long-Only signal engine — v2 (backtest-optimized).
 
 Detects high-probability pullback entries by waiting for price to retrace
 to EMA20 within a well-aligned EMA20/50/200 uptrend, then requiring a
@@ -7,16 +7,15 @@ bullish rejection candle followed by a break-of-high confirmation candle.
 This version is LONG-ONLY. Shorts were removed after backtesting showed
 205 short trades at 35.5% WR and -18.12 USDT net PnL across all timeframes.
 
-v4 changes vs v3 (based on 432-trade backtest):
-  - MIN_SCORE raised 1.5 → 2.5: score <2.5 had 31.9% WR; >=2.5 had PF 1.53
-  - MIN_EMA_SPREAD_ATR raised 0.15 → 0.65: spread <0.30 was inconsistent across
-    periods (PF 2.59 in one backtest, -2.76 PnL in another = not a real edge)
-  - Removed SPREAD_VALLEY_LOW/HIGH — no longer needed since min spread is now 0.65
-  - Net effect: fewer but higher-quality trades (~150 vs ~432)
+Key backtest findings that shaped the filters:
+  - Vol >1.5x avg: exhaustion/liquidation spikes — filtered out
+  - RSI <48 at signal: 28.7% WR, actual weakness — filtered out
+  - EMA spread >1.0 ATR: overextended trend, pullbacks don't bounce — filtered out
+  - Score <1.5: too many marginal setups — filtered out
 
 Score breakdown (max ~4.0):
   2.0  — body quality   (body_ratio vs MIN_BODY_RATIO baseline)
-  1.0  — RSI sweet spot (RSI in 59-61 zone = 1.0, otherwise 0)
+  1.0  — RSI sweet spot (RSI in 53-63 zone = 1.0, otherwise 0)
   1.0  — EMA spread     (EMA20-EMA50 separation relative to ATR, capped at 1.0)
 """
 from __future__ import annotations
@@ -33,16 +32,16 @@ VOL_LOOKBACK           = 20
 ATR_PERIOD             = 14
 MIN_VOL_MULT           = 1.05
 MAX_VOL_MULT           = 1.5
-RSI_LONG_MIN           = 54.0
-RSI_LONG_MAX           = 66.0
+RSI_LONG_MIN           = 48.0
+RSI_LONG_MAX           = 68.0
 MIN_BODY_RATIO         = 0.35
 RR_TARGET              = 2.0
 MIN_RISK_ATR           = 0.5
 MAX_RISK_ATR           = 3.0
 PULLBACK_TOLERANCE_ATR = 0.8
-MIN_EMA_SPREAD_ATR     = 0.65
+MIN_EMA_SPREAD_ATR     = 0.15
 MAX_EMA_SPREAD_ATR     = 1.0
-MIN_SCORE              = 2.5
+MIN_SCORE              = 1.5
 
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
@@ -194,7 +193,7 @@ def evaluate_signal(
     if s_close <= s_ema50:
         return None
 
-    # 6. RSI in sweet spot — not weak, not overbought
+    # 6. RSI in healthy pullback zone — not weak, not overbought
     if not (RSI_LONG_MIN <= s_rsi <= RSI_LONG_MAX):
         return None
 
