@@ -53,8 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from strategy import evaluate_signal  # noqa: E402
 
 # ── configuration ─────────────────────────────────────────────────────────────
-BACKTEST_DAYS = 30
-TOP_SYMBOLS = 300
+TOP_SYMBOLS = 250
 INTERVALS = ["15m", "1h", "4h"]
 CANDLES_PER_INTERVAL: dict[str, int] = {
     "15m": 1500,  # ~15.6 días, weight 10/req. Bajar a 999 = ~10.4 días, weight 5/req
@@ -272,6 +271,10 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
     i = min(230, max(20, len(df) // 2))  # warm-up: use half the data or 230, min 20
     n = len(df)
 
+    def _safe(series: pd.Series, idx: int) -> float:
+        v = series.iloc[idx]
+        return float(v) if not pd.isna(v) else 0.0
+
     while i < n - 1:
         sub = df.iloc[: i + 1]
         try:
@@ -310,10 +313,6 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
 
         # ── extra fields from precomputed indicators ──────────────────────────
         sig_idx = i - 1  # signal candle = sub.iloc[-2] = df.iloc[i-1]
-
-        def _safe(series: pd.Series, idx: int) -> float:
-            v = series.iloc[idx]
-            return float(v) if not pd.isna(v) else 0.0
 
         e20     = _safe(ema20,   sig_idx)
         e50     = _safe(ema50,   sig_idx)

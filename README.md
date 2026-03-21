@@ -1,7 +1,7 @@
 # Binance Futures Scalping Bot
 
 > Algorithmic trading bot for **Binance USDT-M Perpetual Futures**.
-> Scans all USDT-M perpetual pairs in real time, detects high-probability **EMA Pullback Long-Only** setups on M15/1H/4H, and executes one position at a time with automatic TP/SL protection, trailing stop, and loss-based scaling.
+> Scans the top 300 USDT-M perpetual pairs in real time, detects high-probability **EMA Pullback Long-Only** setups on M15/1H/4H, and manages up to 8 concurrent positions with automatic TP/SL protection, trailing stop, and loss-based scaling.
 
 ---
 
@@ -33,13 +33,14 @@
 
 | Feature | Detail |
 |---|---|
-| Symbol universe | All USDT-M perpetual pairs loaded at startup |
+| Symbol universe | Top 300 USDT-M perpetual pairs by 24h quote volume |
 | Signal timeframes | M15, 1H, 4H (long-only) |
 | Entry | Limit order with automatic market fallback after 6 s |
 | Protection | Mandatory TP + SL with auto-recovery if orders disappear |
 | Breakeven | SL moved to entry once +0.5 % profit is reached |
 | Trailing stop | ATR-based trail activates after breakeven |
-| Scaling | Up to 5 scale-in levels on adverse moves |
+| Scaling | Up to 3 scale-in levels on adverse moves |
+| Concurrent positions | Up to 8 simultaneous positions, max 1 per symbol |
 | Risk controls | Cooldown, consecutive-loss pause, daily drawdown cap |
 | Alerts | Telegram notifications for every signal and trade event |
 | WebSocket | Chunked multiplexer with stale detection and auto-restart |
@@ -116,13 +117,12 @@ Minimum score to fire a signal: **1.5**
 ```
 tradingPython/
 ├── main.py          # Orchestrator: stream, signals, execution, monitoring
-├── strategy.py      # Signal engine: 7-filter sweep detector + scorer
+├── strategy.py      # Signal engine: 9-condition EMA Pullback Long-Only + scorer
 ├── execution.py     # Order router: limit/market, TP/SL, OCO monitor, trailing
 ├── data_stream.py   # WebSocket multiplexer + in-memory candle cache
 ├── risk.py          # Cooldown, loss pause, daily drawdown guard
 ├── config.py        # Settings dataclass + .env loader
 ├── indicators.py    # Shared indicator helpers (EMA, ATR)
-├── test_trade.py    # Manual script to validate minimal order placement
 ├── .env.example     # Configuration template (copy to .env)
 └── requirements.txt # Pinned Python dependencies
 ```
@@ -273,7 +273,7 @@ evaluate_signal() ── all 9 conditions pass? ──► signal candidate
   return None             signal accepted
                                 │
                                 ▼ (signals sorted by score)
-RiskManager.can_trade()  AND  no open position?
+RiskManager.can_trade()  AND  active < 8 positions?  AND  symbol not already open?
         │
         ├─ NO  ──► broadcast signal to Telegram, skip execution
         │
@@ -311,13 +311,10 @@ When a position moves against the entry, the bot can add margin at predefined dr
 | Level | Floating Loss Trigger | Additional Margin | Cumulative Exposure |
 |-------|-----------------------|------------------|---------------------|
 | Entry | — | $5 | $5 |
-| L1 | −50 % of $5 = $2.50 | $5 | $10 |
-| L2 | −100 % of $5 = $5.00 | $10 | $20 |
-| L3 | −200 % of $5 = $10.00 | $20 | $40 |
-| L4 | −400 % of $5 = $20.00 | $40 | $80 |
-| L5 | −800 % of $5 = $40.00 | $80 | $160 |
+| L1 | −50 % of margin = $2.50 | $5 | $10 |
+| L2 | −100 % of margin = $5.00 | $10 | $20 |
+| L3 | −200 % of margin = $10.00 | $20 | $40 |
 
-> Set `SCALE_LEVEL*_MARGIN_USDT=0` to disable any individual level.
 > Be aware that scaling significantly increases total risk exposure.
 
 ---
@@ -375,8 +372,7 @@ data_stream.py   WebSocket kline multiplexer with auto-restart
 risk.py          RiskManager: cooldown, loss pause, drawdown guard
 config.py        Settings dataclass and .env loader
 indicators.py    Shared EMA / ATR helpers
-test_trade.py    Manual order validation script
-backtest/        Candle-by-candle backtester across all USDT-M pairs
+backtest/        Candle-by-candle backtester across top-300 USDT-M pairs
 ```
 
 ---

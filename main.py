@@ -31,6 +31,11 @@ _TELEGRAM_SEND_LOCK = threading.Lock()
 _TELEGRAM_LAST_SEND_TS = 0.0
 _TELEGRAM_MIN_INTERVAL_SEC = 1.2
 
+MAX_CONCURRENT_POSITIONS = 8   # hard cap on simultaneous open positions
+MAX_PER_SYMBOL = 1             # max open positions per symbol (enforced via symbols_with_positions filter)
+
+_ENTRY_LOCK = threading.Lock()  # prevents two intervals from placing orders simultaneously
+
 
 def _configure_client(api_key: str, api_secret: str, testnet: bool) -> Client:
     """Build a Binance client and normalize futures endpoint selection."""
@@ -430,194 +435,189 @@ def main() -> None:
             logger.warning("Orphan recovery: failed to fetch positions: %s", exc)
             return
 
-        orphan = None
+        orphans = []
         for p in positions:
             try:
                 amt = float(p.get("positionAmt", 0))
             except Exception:
                 continue
             if abs(amt) > 0:
-                orphan = p
-                break
+                orphans.append(p)
 
-        if orphan is None:
+        if not orphans:
             return
 
-        symbol = orphan.get("symbol", "")
-        if not symbol or symbol not in set(symbols):
-            logger.warning("Orphan recovery: symbol %s not in universe, skipping.", symbol)
-            return
+        def _resume_one(orphan: dict) -> None:
+            """Recover a single orphaned position in its own thread."""
+            symbol = orphan.get("symbol", "")
+            if not symbol or symbol not in set(symbols):
+                logger.warning("Orphan recovery: symbol %s not in universe, skipping.", symbol)
+                return
 
-        try:
-            qty = abs(float(orphan.get("positionAmt", 0)))
-            entry_price = float(orphan.get("entryPrice", 0))
-            side = "BUY" if float(orphan.get("positionAmt", 0)) > 0 else "SELL"
-        except Exception as exc:
-            logger.warning("Orphan recovery: could not parse position data: %s", exc)
-            return
+            try:
+                qty = abs(float(orphan.get("positionAmt", 0)))
+                entry_price = float(orphan.get("entryPrice", 0))
+                side = "BUY" if float(orphan.get("positionAmt", 0)) > 0 else "SELL"
+            except Exception as exc:
+                logger.warning("Orphan recovery: could not parse position data: %s", exc)
+                return
 
-        if qty <= 0 or entry_price <= 0:
-            logger.warning("Orphan recovery: invalid qty=%.4f entry=%.4f, skipping.", qty, entry_price)
-            return
+            if qty <= 0 or entry_price <= 0:
+                logger.warning(
+                    "Orphan recovery: invalid qty=%.4f entry=%.4f, skipping.", qty, entry_price,
+                )
+                return
 
-        logger.info(
-            "Orphan recovery: resuming %s side=%s qty=%.4f entry=%.4f",
-            symbol, side, qty, entry_price,
-        )
-
-        # Estimate SL and TP from existing orders, falling back to ATR.
-        sl_price: float | None = None
-        tp_price: float | None = None
-        try:
-            open_orders = trade_client.futures_get_open_orders(symbol=symbol)
-            for o in open_orders:
-                ot = o.get("type", "")
-                sp = float(o.get("stopPrice", 0) or 0)
-                if sp <= 0:
-                    continue
-                if ot == "STOP_MARKET" and sl_price is None:
-                    sl_price = sp
-                elif ot == "TAKE_PROFIT_MARKET" and tp_price is None:
-                    tp_price = sp
-        except Exception as exc:
-            logger.warning("Orphan recovery: could not fetch open orders: %s", exc)
-
-        df_orphan = stream.get_dataframe(symbol, settings.main_interval)
-        atr_orphan = _calc_atr(df_orphan, settings.atr_period) if not df_orphan.empty else 0.0
-
-        if sl_price is None:
-            sl_price = (
-                entry_price - settings.stop_atr_mult * atr_orphan
-                if side == "BUY"
-                else entry_price + settings.stop_atr_mult * atr_orphan
-            )
-        if tp_price is None:
-            risk_est = abs(entry_price - sl_price)
-            tp_price = (
-                entry_price + risk_est * max(float(settings.tp_rr), 1.8)
-                if side == "BUY"
-                else entry_price - risk_est * max(float(settings.tp_rr), 1.8)
+            logger.info(
+                "Orphan recovery: resuming %s side=%s qty=%.4f entry=%.4f",
+                symbol, side, qty, entry_price,
             )
 
-        executor = get_executor(symbol)
-        qty_rounded = executor.round_qty(qty)
-        risk_distance = abs(entry_price - sl_price)
-        breakeven_pct = max(risk_distance / entry_price, 0.005) if entry_price > 0 else 0.005
-
-        orphan_trade_state = {
-            "entry_price": entry_price,
-            "qty": qty_rounded,
-            "sl": sl_price,
-            "tp": tp_price,
-            "risk_distance": risk_distance,
-            "breakeven_trigger_pct": breakeven_pct,
-            "anchor_entry_price": entry_price,
-            "anchor_risk_distance": risk_distance,
-            "tp_risk_cap": risk_distance,
-            "db_trade_id": None,
-        }
-        orphan_level_state = {
-            "loss_l1_done": True,
-            "loss_l2_done": True,
-            "loss_l3_done": True,
-            "loss_l1_attempts": 0,
-            "loss_l2_attempts": 0,
-            "loss_l3_attempts": 0,
-            "loss_l1_next_try_ts": 0.0,
-            "loss_l2_next_try_ts": 0.0,
-            "loss_l3_next_try_ts": 0.0,
-        }
-
-        client_id_prefix = f"{symbol}-orphan-{int(time.time() * 1000)}"
-
-        def _orphan_price_fn() -> float | None:
-            return _get_mark_price(trade_client, symbol)
-
-        def _orphan_atr_fn() -> float | None:
-            _df = stream.get_dataframe(symbol, settings.main_interval)
-            return _calc_atr(_df, settings.atr_period)
-
-        def _orphan_on_event(kind: str, new_sl: float) -> None:
-            trades_logger.info("%s %s new_sl=%.4f (orphan)", kind, symbol, new_sl)
-
-        def _orphan_monitor() -> None:
-            attempts = 0
-            tp_ref = sl_ref = None
-            position_wait_deadline = time.time() + 10.0
-
-            while True:
-                try:
-                    has_pos = executor.has_open_position()
-                except Exception:
-                    has_pos = False
-                if not has_pos:
-                    if time.time() < position_wait_deadline:
-                        time.sleep(0.5)
+            # Estimate SL and TP from existing orders, falling back to ATR.
+            sl_price: float | None = None
+            tp_price: float | None = None
+            try:
+                open_orders = trade_client.futures_get_open_orders(symbol=symbol)
+                for o in open_orders:
+                    ot = o.get("type", "")
+                    sp = float(o.get("stopPrice", 0) or 0)
+                    if sp <= 0:
                         continue
-                    trades_logger.info("orphan %s reason=position_gone", symbol)
-                    return
+                    if ot == "STOP_MARKET" and sl_price is None:
+                        sl_price = sp
+                    elif ot == "TAKE_PROFIT_MARKET" and tp_price is None:
+                        tp_price = sp
+            except Exception as exc:
+                logger.warning("Orphan recovery: could not fetch open orders: %s", exc)
 
-                try:
-                    existing_tp, existing_sl = executor.get_protection_refs(
-                        side, client_id_prefix=client_id_prefix
-                    )
-                    if existing_tp and existing_sl:
-                        tp_ref, sl_ref = existing_tp, existing_sl
-                        break
-                    tp_ref, sl_ref = executor.place_tp_sl(
-                        side,
-                        float(orphan_trade_state["tp"]),
-                        float(orphan_trade_state["sl"]),
-                        float(orphan_trade_state["qty"]),
-                        client_id_prefix=client_id_prefix,
-                    )
-                    if tp_ref and sl_ref:
-                        break
-                except Exception as exc:
-                    logger.error("Orphan TP/SL placement failed %s: %s", symbol, exc)
+            df_orphan = stream.get_dataframe(symbol, settings.main_interval)
+            atr_orphan = _calc_atr(df_orphan, settings.atr_period) if not df_orphan.empty else 0.0
 
-                attempts += 1
-                time.sleep(2)
-                if attempts >= 15:
-                    trades_logger.info("critical %s reason=orphan_tp_sl_fail", symbol)
-                    return
+            if sl_price is None:
+                sl_price = (
+                    entry_price - settings.stop_atr_mult * atr_orphan
+                    if side == "BUY"
+                    else entry_price + settings.stop_atr_mult * atr_orphan
+                )
+            if tp_price is None:
+                risk_est = abs(entry_price - sl_price)
+                tp_price = (
+                    entry_price + risk_est * max(float(settings.tp_rr), 1.8)
+                    if side == "BUY"
+                    else entry_price - risk_est * max(float(settings.tp_rr), 1.8)
+                )
 
-            trades_logger.info(
-                "orphan_resumed %s side=%s price=%.4f qty=%.6f tp=%.4f sl=%.4f",
-                symbol, side, entry_price, qty_rounded,
-                float(orphan_trade_state["tp"]), float(orphan_trade_state["sl"]),
-            )
+            executor = get_executor(symbol)
+            qty_rounded = executor.round_qty(qty)
+            risk_distance = abs(entry_price - sl_price)
+            breakeven_pct = max(risk_distance / entry_price, 0.005) if entry_price > 0 else 0.005
 
-            result, exit_price_val = executor.monitor_oco(
-                tp_ref,
-                sl_ref,
-                side=side,
-                entry_price=float(orphan_trade_state["entry_price"]),
-                tp_price=float(orphan_trade_state["tp"]),
-                sl_price=float(orphan_trade_state["sl"]),
-                qty=float(orphan_trade_state["qty"]),
-                atr=atr_orphan,
-                breakeven_trigger_pct=float(orphan_trade_state["breakeven_trigger_pct"]),
-                trail_mult=0.8,
-                trail_activation_pct=max(settings.trailing_activation_pct, 0.01),
-                price_fn=_orphan_price_fn,
-                atr_fn=_orphan_atr_fn,
-                on_event=_orphan_on_event,
-                scale_fn=None,
-                safety_check_sec=2,
-                review_fn=None,
-                review_sec=7,
-                client_id_prefix=client_id_prefix,
-            )
-            final_entry = float(orphan_trade_state["entry_price"])
-            final_qty = float(orphan_trade_state["qty"])
-            pnl = (exit_price_val - final_entry) * final_qty
-            if side == "SELL":
-                pnl = -pnl
-            risk.update_trade(pnl, datetime.now(timezone.utc))
-            trades_logger.info("orphan_exit %s result=%s pnl=%.4f", symbol, result, pnl)
+            orphan_trade_state = {
+                "entry_price": entry_price,
+                "qty": qty_rounded,
+                "sl": sl_price,
+                "tp": tp_price,
+                "risk_distance": risk_distance,
+                "breakeven_trigger_pct": breakeven_pct,
+                "anchor_entry_price": entry_price,
+                "anchor_risk_distance": risk_distance,
+                "tp_risk_cap": risk_distance,
+                "db_trade_id": None,
+            }
 
-        threading.Thread(target=_orphan_monitor, daemon=True, name=f"orphan-{symbol}").start()
+            client_id_prefix = f"{symbol}-orphan-{int(time.time() * 1000)}"
+
+            def _orphan_price_fn() -> float | None:
+                return _get_mark_price(trade_client, symbol)
+
+            def _orphan_atr_fn() -> float | None:
+                _df = stream.get_dataframe(symbol, settings.main_interval)
+                return _calc_atr(_df, settings.atr_period)
+
+            def _orphan_on_event(kind: str, new_sl: float) -> None:
+                trades_logger.info("%s %s new_sl=%.4f (orphan)", kind, symbol, new_sl)
+
+            def _orphan_monitor() -> None:
+                attempts = 0
+                tp_ref = sl_ref = None
+                position_wait_deadline = time.time() + 10.0
+
+                while True:
+                    try:
+                        has_pos = executor.has_open_position()
+                    except Exception:
+                        has_pos = False
+                    if not has_pos:
+                        if time.time() < position_wait_deadline:
+                            time.sleep(0.5)
+                            continue
+                        trades_logger.info("orphan %s reason=position_gone", symbol)
+                        return
+
+                    try:
+                        existing_tp, existing_sl = executor.get_protection_refs(
+                            side, client_id_prefix=client_id_prefix
+                        )
+                        if existing_tp and existing_sl:
+                            tp_ref, sl_ref = existing_tp, existing_sl
+                            break
+                        tp_ref, sl_ref = executor.place_tp_sl(
+                            side,
+                            float(orphan_trade_state["tp"]),
+                            float(orphan_trade_state["sl"]),
+                            float(orphan_trade_state["qty"]),
+                            client_id_prefix=client_id_prefix,
+                        )
+                        if tp_ref and sl_ref:
+                            break
+                    except Exception as exc:
+                        logger.error("Orphan TP/SL placement failed %s: %s", symbol, exc)
+
+                    attempts += 1
+                    time.sleep(2)
+                    if attempts >= 15:
+                        trades_logger.info("critical %s reason=orphan_tp_sl_fail", symbol)
+                        return
+
+                trades_logger.info(
+                    "orphan_resumed %s side=%s price=%.4f qty=%.6f tp=%.4f sl=%.4f",
+                    symbol, side, entry_price, qty_rounded,
+                    float(orphan_trade_state["tp"]), float(orphan_trade_state["sl"]),
+                )
+
+                result, exit_price_val = executor.monitor_oco(
+                    tp_ref,
+                    sl_ref,
+                    side=side,
+                    entry_price=float(orphan_trade_state["entry_price"]),
+                    tp_price=float(orphan_trade_state["tp"]),
+                    sl_price=float(orphan_trade_state["sl"]),
+                    qty=float(orphan_trade_state["qty"]),
+                    atr=atr_orphan,
+                    breakeven_trigger_pct=float(orphan_trade_state["breakeven_trigger_pct"]),
+                    trail_mult=0.8,
+                    trail_activation_pct=max(settings.trailing_activation_pct, 0.01),
+                    price_fn=_orphan_price_fn,
+                    atr_fn=_orphan_atr_fn,
+                    on_event=_orphan_on_event,
+                    scale_fn=None,
+                    safety_check_sec=2,
+                    review_fn=None,
+                    review_sec=7,
+                    client_id_prefix=client_id_prefix,
+                )
+                final_entry = float(orphan_trade_state["entry_price"])
+                final_qty = float(orphan_trade_state["qty"])
+                pnl = (exit_price_val - final_entry) * final_qty
+                if side == "SELL":
+                    pnl = -pnl
+                risk.update_trade(pnl, datetime.now(timezone.utc))
+                trades_logger.info("orphan_exit %s result=%s pnl=%.4f", symbol, result, pnl)
+
+            threading.Thread(target=_orphan_monitor, daemon=True, name=f"orphan-{symbol}").start()
+
+        for orphan in orphans:
+            _resume_one(orphan)
 
     def make_on_close(interval: str) -> Callable[[str], None]:
         """Factory: return a per-interval evaluation/execution callback."""
@@ -650,7 +650,11 @@ def main() -> None:
                 1 for p in positions_snapshot
                 if abs(float(p.get("positionAmt", 0))) > 0
             )
-            has_open_position = active_positions > 0
+            symbols_with_positions = {
+                p["symbol"] for p in positions_snapshot
+                if abs(float(p.get("positionAmt", 0))) > 0
+            }
+            has_open_position = active_positions >= MAX_CONCURRENT_POSITIONS
 
             valid_signals: list[tuple[str, dict]] = []
 
@@ -700,18 +704,39 @@ def main() -> None:
                 reverse=True,
             )
 
+            # Remove signals for symbols that already have an open position
+            valid_signals = [
+                (sym, sig) for sym, sig in valid_signals
+                if sym not in symbols_with_positions
+            ]
+            if not valid_signals:
+                trades_logger.info(
+                    "all_signals_skipped tf=%s reason=per_symbol_limit active=%d",
+                    interval, active_positions,
+                )
+                return
+
             execution_allowed = can_trade_now and not has_open_position
             block_reason = ""
             if has_open_position:
-                block_reason = "SEÑAL BLOQUEADA POR OPERACIÓN ACTIVA"
+                block_reason = f"SEÑAL BLOQUEADA: MÁXIMO DE POSICIONES ALCANZADO ({active_positions}/{MAX_CONCURRENT_POSITIONS})"
             elif not can_trade_now:
                 block_reason = "BLOQUEADA POR RISK MANAGER"
 
             if execution_allowed:
                 try:
-                    if _has_any_position(trade_client):
+                    live_positions = trade_client.futures_position_information()
+                    live_count = sum(
+                        1 for p in live_positions
+                        if abs(float(p.get("positionAmt", 0))) > 0
+                    )
+                    if live_count >= MAX_CONCURRENT_POSITIONS:
                         execution_allowed = False
-                        block_reason = "SEÑAL BLOQUEADA POR OPERACIÓN ACTIVA"
+                        block_reason = f"SEÑAL BLOQUEADA: MÁXIMO DE POSICIONES ALCANZADO ({live_count}/{MAX_CONCURRENT_POSITIONS})"
+                        symbols_with_positions = {
+                            p["symbol"] for p in live_positions
+                            if abs(float(p.get("positionAmt", 0))) > 0
+                        }
                 except Exception as exc:
                     logger.warning("Failed position gate: %s", exc)
                     execution_allowed = False
@@ -871,22 +896,60 @@ def main() -> None:
                 )
                 return
 
-            try:
-                trade_client.futures_cancel_all_open_orders(symbol=symbol)
-            except Exception as exc:
-                logger.warning("Pre-entry open-order cleanup failed for %s: %s", symbol, exc)
-
-            try:
-                filled_qty, avg_price, exec_type = executor.place_limit_with_market_fallback(
-                    side=side,
-                    price=entry_price,
-                    qty=qty_l1,
-                    timeout_sec=settings.limit_timeout_sec,
+            # Acquire lock for atomic final-check + order-place to prevent
+            # two interval callbacks from opening trades simultaneously.
+            if not _ENTRY_LOCK.acquire(blocking=False):
+                trades_logger.info(
+                    "signal_only tf=%s reason=entry_lock_busy sym=%s",
+                    interval, symbol,
                 )
-            except Exception as exc:
-                logger.error("Order placement failed %s: %s", symbol, exc)
-                trades_logger.info("error %s stage=entry_l1 msg=%s", symbol, exc)
                 return
+
+            filled_qty = avg_price = exec_type = None
+            try:
+                # Final position recheck while holding the lock
+                try:
+                    recheck = trade_client.futures_position_information()
+                    recheck_count = sum(
+                        1 for p in recheck if abs(float(p.get("positionAmt", 0))) > 0
+                    )
+                    if recheck_count >= MAX_CONCURRENT_POSITIONS:
+                        trades_logger.info(
+                            "signal_only tf=%s reason=concurrent_limit_recheck active=%d",
+                            interval, recheck_count,
+                        )
+                        return
+                    if symbol in {
+                        p["symbol"] for p in recheck
+                        if abs(float(p.get("positionAmt", 0))) > 0
+                    }:
+                        trades_logger.info(
+                            "signal_only tf=%s reason=symbol_already_open sym=%s",
+                            interval, symbol,
+                        )
+                        return
+                except Exception as exc:
+                    logger.warning("Lock-recheck failed: %s", exc)
+                    return
+
+                try:
+                    trade_client.futures_cancel_all_open_orders(symbol=symbol)
+                except Exception as exc:
+                    logger.warning("Pre-entry open-order cleanup failed for %s: %s", symbol, exc)
+
+                try:
+                    filled_qty, avg_price, exec_type = executor.place_limit_with_market_fallback(
+                        side=side,
+                        price=entry_price,
+                        qty=qty_l1,
+                        timeout_sec=settings.limit_timeout_sec,
+                    )
+                except Exception as exc:
+                    logger.error("Order placement failed %s: %s", symbol, exc)
+                    trades_logger.info("error %s stage=entry_l1 msg=%s", symbol, exc)
+                    return
+            finally:
+                _ENTRY_LOCK.release()
 
             if filled_qty <= 0:
                 trades_logger.info("skip %s reason=entry_l1_not_filled", symbol)
@@ -1226,7 +1289,7 @@ def main() -> None:
                 def review_fn(break_even: bool) -> tuple[bool, str]:
                     """Run structure/volume/context reviews for potential early exits."""
                     _df = stream.get_dataframe(symbol, interval)
-                    _ctx = stream.get_dataframe(symbol, interval)
+                    _ctx = _df
                     if _df.empty or len(_df) < max(settings.ema_mid, settings.ema_fast, settings.volume_avg_window + 2, 4):
                         return False, "no_data"
 
