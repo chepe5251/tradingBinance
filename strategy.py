@@ -1,4 +1,4 @@
-"""EMA Pullback Long-Only signal engine for M15 futures (backtest-optimized).
+"""EMA Pullback Long-Only signal engine — v4 (backtest-refined).
 
 Detects high-probability pullback entries by waiting for price to retrace
 to EMA20 within a well-aligned EMA20/50/200 uptrend, then requiring a
@@ -7,15 +7,16 @@ bullish rejection candle followed by a break-of-high confirmation candle.
 This version is LONG-ONLY. Shorts were removed after backtesting showed
 205 short trades at 35.5% WR and -18.12 USDT net PnL across all timeframes.
 
-Key backtest findings that shaped the filters:
-  - Vol >1.5x avg: -4.16 USDT (exhaustion/liquidation spikes)
-  - RSI <40 at signal: 28.7% WR and -20.19 USDT (actual weakness, not rest)
-  - EMA spread >1.0 ATR: -26.31 USDT in 142 trades (overextended trend)
-  - Score <1.5: 23.1% WR (too many marginal setups)
+v4 changes vs v3 (based on 432-trade backtest):
+  - MIN_SCORE raised 1.5 → 2.5: score <2.5 had 31.9% WR; >=2.5 had PF 1.53
+  - MIN_EMA_SPREAD_ATR raised 0.15 → 0.65: spread <0.30 was inconsistent across
+    periods (PF 2.59 in one backtest, -2.76 PnL in another = not a real edge)
+  - Removed SPREAD_VALLEY_LOW/HIGH — no longer needed since min spread is now 0.65
+  - Net effect: fewer but higher-quality trades (~150 vs ~432)
 
 Score breakdown (max ~4.0):
   2.0  — body quality   (body_ratio vs MIN_BODY_RATIO baseline)
-  1.0  — RSI sweet spot (RSI in 53-63 zone = 1.0, otherwise 0)
+  1.0  — RSI sweet spot (RSI in 59-61 zone = 1.0, otherwise 0)
   1.0  — EMA spread     (EMA20-EMA50 separation relative to ATR, capped at 1.0)
 """
 from __future__ import annotations
@@ -32,16 +33,16 @@ VOL_LOOKBACK           = 20
 ATR_PERIOD             = 14
 MIN_VOL_MULT           = 1.05
 MAX_VOL_MULT           = 1.5
-RSI_LONG_MIN           = 48.0
-RSI_LONG_MAX           = 68.0
+RSI_LONG_MIN           = 54.0
+RSI_LONG_MAX           = 66.0
 MIN_BODY_RATIO         = 0.35
 RR_TARGET              = 2.0
 MIN_RISK_ATR           = 0.5
 MAX_RISK_ATR           = 3.0
 PULLBACK_TOLERANCE_ATR = 0.8
-MIN_EMA_SPREAD_ATR     = 0.15
+MIN_EMA_SPREAD_ATR     = 0.65
 MAX_EMA_SPREAD_ATR     = 1.0
-MIN_SCORE              = 1.5
+MIN_SCORE              = 2.5
 
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
@@ -104,12 +105,13 @@ def evaluate_signal(
         return None
 
     df = main_df.copy()
-    df["ema20"]   = _ema(df["close"], EMA_FAST)
-    df["ema50"]   = _ema(df["close"], EMA_MID)
-    df["ema200"]  = _ema(df["close"], EMA_SLOW)
-    df["atr"]     = _atr(df, ATR_PERIOD)
-    df["avg_vol"] = df["volume"].rolling(VOL_LOOKBACK).mean()
-    df["rsi"]     = _rsi(df["close"], RSI_PERIOD)
+    if "ema20" not in df.columns:
+        df["ema20"]   = _ema(df["close"], EMA_FAST)
+        df["ema50"]   = _ema(df["close"], EMA_MID)
+        df["ema200"]  = _ema(df["close"], EMA_SLOW)
+        df["atr"]     = _atr(df, ATR_PERIOD)
+        df["avg_vol"] = df["volume"].rolling(VOL_LOOKBACK).mean()
+        df["rsi"]     = _rsi(df["close"], RSI_PERIOD)
 
     if len(df) < 3:
         return None
@@ -172,14 +174,15 @@ def evaluate_signal(
     if not (s_ema20 > s_ema50 and s_ema50 > s_ema200):
         return None
 
-    spread = s_ema20 - s_ema50
+    spread     = s_ema20 - s_ema50
+    spread_atr = spread / s_atr
 
     # 2. Minimum EMA separation — filters flat/ranging markets
-    if spread < MIN_EMA_SPREAD_ATR * s_atr:
+    if spread_atr < MIN_EMA_SPREAD_ATR:
         return None
 
     # 3. Trend not overextended — spread >1.0 ATR = pullbacks don't bounce
-    if spread > MAX_EMA_SPREAD_ATR * s_atr:
+    if spread_atr > MAX_EMA_SPREAD_ATR:
         return None
 
     # 4. Price pulled back to EMA20 (signal candle low within tolerance band)
@@ -191,7 +194,7 @@ def evaluate_signal(
     if s_close <= s_ema50:
         return None
 
-    # 6. RSI in healthy pullback zone (not weak, not overbought)
+    # 6. RSI in sweet spot — not weak, not overbought
     if not (RSI_LONG_MIN <= s_rsi <= RSI_LONG_MAX):
         return None
 
@@ -214,8 +217,7 @@ def evaluate_signal(
     if risk < MIN_RISK_ATR * s_atr or risk > MAX_RISK_ATR * s_atr:
         return None
 
-    tp_price   = entry_price + risk * RR_TARGET
-    spread_atr = spread / s_atr
+    tp_price = entry_price + risk * RR_TARGET
 
     # ── score ─────────────────────────────────────────────────────────────────
     score = round(
@@ -229,16 +231,16 @@ def evaluate_signal(
         return None
 
     return {
-        "side":         "BUY",
-        "price":        entry_price,
-        "stop_price":   stop_price,
-        "tp_price":     tp_price,
+        "side":          "BUY",
+        "price":         entry_price,
+        "stop_price":    stop_price,
+        "tp_price":      tp_price,
         "risk_per_unit": risk,
-        "rr_target":    RR_TARGET,
-        "atr":          float(s_atr),
-        "score":        score,
-        "strategy":     "ema_pullback_long",
-        "confirm_m15":  (
+        "rr_target":     RR_TARGET,
+        "atr":           float(s_atr),
+        "score":         score,
+        "strategy":      "ema_pullback_long",
+        "confirm_m15":   (
             f"EMA20 pullback at {s_ema20:.4f} | "
             f"body={body_ratio:.2f} | "
             f"vol={s_vol/s_avg_vol:.1f}x | "

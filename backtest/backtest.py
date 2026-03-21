@@ -1,8 +1,8 @@
 """Backtest — EMA Pullback momentum strategy.
 
 Downloads historical Binance Futures klines, runs evaluate_signal candle-by-candle
-for M15 / 1H / 4H across the top 50 USDT-M pairs, calculates metrics, and saves
-two CSV files: one with individual trades and one with aggregated analysis.
+for M15 / 1H / 4H across all USDT-M perpetual pairs, calculates metrics, and saves
+three CSV files: individual trades, aggregated analysis, and equity curve.
 
 Usage (from repo root):
     python backtest/backtest.py
@@ -10,11 +10,12 @@ Usage (from repo root):
 from __future__ import annotations
 
 import csv
+import multiprocessing
 import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
@@ -26,9 +27,13 @@ from strategy import evaluate_signal  # noqa: E402
 
 # ── configuration ─────────────────────────────────────────────────────────────
 BACKTEST_DAYS = 30
-TOP_SYMBOLS = 150
+TOP_SYMBOLS = 300
 INTERVALS = ["15m", "1h", "4h"]
-CANDLES_PER_INTERVAL: dict[str, int] = {"15m": 1500, "1h": 720, "4h": 500}
+CANDLES_PER_INTERVAL: dict[str, int] = {
+    "15m": 1500,  # ~15.6 días, weight 10/req. Bajar a 999 = ~10.4 días, weight 5/req
+    "1h":  720,   # ~30 días, weight 5/req
+    "4h":  500,   # ~83 días, weight 5/req
+}
 INITIAL_CAPITAL = 500.0
 MARGIN_PER_TRADE = 5.0
 LEVERAGE = 20
@@ -53,7 +58,44 @@ _EVAL_KWARGS: dict = dict(
 
 MAX_CANDLES_HOLD = 50   # close at market after this many candles
 SKIP_AFTER_SIGNAL = 10  # skip candles after a signal to avoid overlap
-MAX_WORKERS = 20        # parallel download threads
+MAX_DL_WORKERS = 60     # threads para descarga I/O (rate limiter controla la velocidad real)
+SIM_WORKERS    = multiprocessing.cpu_count()  # procesos para simulación CPU-bound
+
+
+# ── rate limiter ─────────────────────────────────────────────────────────────
+
+class RateLimiter:
+    """Thread-safe rate limiter for Binance API weight budget."""
+
+    def __init__(self, max_weight_per_minute: int = 2300) -> None:
+        # Use 2300 of 2400 available as minimal safety margin
+        self._max = max_weight_per_minute
+        self._lock = threading.Lock()
+        self._timestamps: list[tuple[float, int]] = []  # (time, weight)
+
+    def _weight_for_limit(self, limit: int) -> int:
+        if limit < 100:
+            return 1
+        if limit < 500:
+            return 2
+        if limit < 1000:
+            return 5
+        return 10
+
+    def acquire(self, limit: int) -> None:
+        weight = self._weight_for_limit(limit)
+        while True:
+            with self._lock:
+                now = time.time()
+                self._timestamps = [(t, w) for t, w in self._timestamps if now - t < 60]
+                current_weight = sum(w for _, w in self._timestamps)
+                if current_weight + weight <= self._max:
+                    self._timestamps.append((now, weight))
+                    return
+            time.sleep(0.05)  # Poll cada 50ms — agresivo pero no quema CPU
+
+
+_rate_limiter = RateLimiter()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -116,16 +158,15 @@ def _fetch_klines(client: Client, symbol: str, interval: str, limit: int) -> pd.
     """Download klines and return a clean DataFrame."""
     max_retries = 3
     klines = None
+    _rate_limiter.acquire(limit)
     for attempt in range(max_retries):
         try:
             klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-            time.sleep(0.3)  # pausa entre requests exitosas
             break
         except Exception as e:
             if attempt < max_retries - 1:
-                wait = 5 * (attempt + 1)  # 5s, 10s, 15s
-                print(f"  [RETRY {attempt+1}/{max_retries}] {symbol} {interval}: esperando {wait}s...")
-                time.sleep(wait)
+                print(f"  [RETRY {attempt+1}/{max_retries}] {symbol} {interval}: esperando 1s...")
+                time.sleep(1)
             else:
                 raise e
     rows = [
@@ -144,6 +185,13 @@ def _fetch_klines(client: Client, symbol: str, interval: str, limit: int) -> pd.
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     return df
+
+
+def _fmt_ts(ts) -> str:
+    """Format a close_time value to a readable UTC string."""
+    if isinstance(ts, pd.Timestamp):
+        return ts.strftime("%Y-%m-%d %H:%M UTC")
+    return str(ts)
 
 
 # ── local indicator helpers (for extra CSV fields) ────────────────────────────
@@ -184,12 +232,12 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
     Returns (trades, skipped_4h_sell, skipped_low_score).
     """
     # Precompute indicators once for extra CSV fields
-    ema20  = _ema_col(df["close"], 20)
-    ema50  = _ema_col(df["close"], 50)
-    ema200 = _ema_col(df["close"], 200)
-    atr    = _atr_col(df, ATR_PERIOD)
+    ema20   = _ema_col(df["close"], 20)
+    ema50   = _ema_col(df["close"], 50)
+    ema200  = _ema_col(df["close"], 200)
+    atr     = _atr_col(df, ATR_PERIOD)
     avg_vol = df["volume"].rolling(20).mean()
-    rsi    = _rsi_col(df["close"], 14)
+    rsi     = _rsi_col(df["close"], 14)
 
     trades: list[dict] = []
     skipped_4h_sell = 0
@@ -230,9 +278,12 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
             i += 1
             continue
 
+        # entry_time: close_time of confirmation candle (df.iloc[i])
+        entry_time = _fmt_ts(df.iloc[i]["close_time"])
+
         # ── extra fields from precomputed indicators ──────────────────────────
-        # Signal candle = sub.iloc[-2] = df.iloc[i-1]
-        sig_idx = i - 1
+        sig_idx = i - 1  # signal candle = sub.iloc[-2] = df.iloc[i-1]
+
         def _safe(series: pd.Series, idx: int) -> float:
             v = series.iloc[idx]
             return float(v) if not pd.isna(v) else 0.0
@@ -251,14 +302,14 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
         s_close = float(sig_row["close"])
         s_vol   = float(sig_row["volume"])
 
-        rng          = s_high - s_low
-        body         = abs(s_close - s_open)
-        body_ratio   = body / rng if rng > 0 else 0.0
-        vol_ratio    = s_vol / avv_sig if avv_sig > 0 else 0.0
-        ema_spread   = (e20 - e50) / atr_sig if atr_sig > 0 else 0.0
-        dist_tp      = abs(tp_price - entry_price)
-        dist_sl      = abs(entry_price - stop_price)
-        rr_planned   = dist_tp / dist_sl if dist_sl > 0 else 0.0
+        rng        = s_high - s_low
+        body       = abs(s_close - s_open)
+        body_ratio = body / rng if rng > 0 else 0.0
+        vol_ratio  = s_vol / avv_sig if avv_sig > 0 else 0.0
+        ema_spread = (e20 - e50) / atr_sig if atr_sig > 0 else 0.0
+        dist_tp    = abs(tp_price - entry_price)
+        dist_sl    = abs(entry_price - stop_price)
+        rr_planned = dist_tp / dist_sl if dist_sl > 0 else 0.0
 
         if e20 > e50 and e50 > e200:
             market_phase = "UPTREND"
@@ -271,8 +322,10 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
         commission = qty * entry_price * COMMISSION_PCT * 2
 
         # Simulate: scan next candles for SL/TP hit
-        result      = "TIMEOUT"
-        exit_price  = float(df.iloc[min(i + MAX_CANDLES_HOLD, n - 1)]["close"])
+        result     = "TIMEOUT"
+        timeout_j  = min(i + MAX_CANDLES_HOLD, n - 1)
+        exit_price = float(df.iloc[timeout_j]["close"])
+        exit_j     = timeout_j
         candles_held = 0
 
         for j in range(i + 1, min(i + MAX_CANDLES_HOLD + 1, n)):
@@ -285,28 +338,36 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
                 if c_high >= tp_price and c_low <= stop_price:
                     result = "LOSS"
                     exit_price = stop_price
+                    exit_j = j
                     break
                 if c_high >= tp_price:
                     result = "WIN"
                     exit_price = tp_price
+                    exit_j = j
                     break
                 if c_low <= stop_price:
                     result = "LOSS"
                     exit_price = stop_price
+                    exit_j = j
                     break
             else:  # SELL
                 if c_low <= tp_price and c_high >= stop_price:
                     result = "LOSS"
                     exit_price = stop_price
+                    exit_j = j
                     break
                 if c_low <= tp_price:
                     result = "WIN"
                     exit_price = tp_price
+                    exit_j = j
                     break
                 if c_high >= stop_price:
                     result = "LOSS"
                     exit_price = stop_price
+                    exit_j = j
                     break
+
+        exit_time = _fmt_ts(df.iloc[exit_j]["close_time"])
 
         if side == "BUY":
             gross_pnl = (exit_price - entry_price) * qty
@@ -318,6 +379,8 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
             "symbol":        symbol,
             "interval":      interval,
             "side":          side,
+            "entry_time":    entry_time,
+            "exit_time":     exit_time,
             "entry_price":   round(entry_price, 8),
             "exit_price":    round(exit_price, 8),
             "stop_price":    round(stop_price, 8),
@@ -328,14 +391,14 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
             "score":         score,
             "signal_candle": i,
             # Extra fields
-            "ema_spread":       round(ema_spread, 4),
-            "rsi_at_signal":    round(rsi_sig, 2),
-            "vol_ratio":        round(vol_ratio, 3),
-            "body_ratio":       round(body_ratio, 3),
-            "distance_to_tp":   round(dist_tp, 8),
-            "distance_to_sl":   round(dist_sl, 8),
-            "rr_planned":       round(rr_planned, 3),
-            "market_phase":     market_phase,
+            "ema_spread":      round(ema_spread, 4),
+            "rsi_at_signal":   round(rsi_sig, 2),
+            "vol_ratio":       round(vol_ratio, 3),
+            "body_ratio":      round(body_ratio, 3),
+            "distance_to_tp":  round(dist_tp, 8),
+            "distance_to_sl":  round(dist_sl, 8),
+            "rr_planned":      round(rr_planned, 3),
+            "market_phase":    market_phase,
         })
 
         i += SKIP_AFTER_SIGNAL
@@ -352,27 +415,32 @@ def _compute_stats(trades: list[dict]) -> dict:
             "total": 0, "wins": 0, "losses": 0, "timeouts": 0,
             "winrate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
             "avg_win": 0.0, "avg_loss": 0.0, "rr_real": 0.0,
+            "profit_factor": 0.0,
         }
-    wins    = [t for t in trades if t["result"] == "WIN"]
-    losses  = [t for t in trades if t["result"] == "LOSS"]
+    wins     = [t for t in trades if t["result"] == "WIN"]
+    losses   = [t for t in trades if t["result"] == "LOSS"]
     timeouts = [t for t in trades if t["result"] == "TIMEOUT"]
-    total   = len(trades)
-    total_pnl = sum(t["pnl_usdt"] for t in trades)
-    avg_pnl   = total_pnl / total
-    avg_win   = sum(t["pnl_usdt"] for t in wins)   / len(wins)   if wins   else 0.0
-    avg_loss  = sum(t["pnl_usdt"] for t in losses) / len(losses) if losses else 0.0
-    rr_real   = avg_win / abs(avg_loss) if losses and avg_loss != 0 else 0.0
+    total    = len(trades)
+    total_pnl    = sum(t["pnl_usdt"] for t in trades)
+    avg_pnl      = total_pnl / total
+    avg_win      = sum(t["pnl_usdt"] for t in wins)   / len(wins)   if wins   else 0.0
+    avg_loss     = sum(t["pnl_usdt"] for t in losses) / len(losses) if losses else 0.0
+    rr_real      = avg_win / abs(avg_loss) if losses and avg_loss != 0 else 0.0
+    gross_profit = sum(t["pnl_usdt"] for t in trades if t["pnl_usdt"] > 0)
+    gross_loss   = abs(sum(t["pnl_usdt"] for t in trades if t["pnl_usdt"] < 0))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
     return {
-        "total":     total,
-        "wins":      len(wins),
-        "losses":    len(losses),
-        "timeouts":  len(timeouts),
-        "winrate":   len(wins) / total * 100,
-        "total_pnl": total_pnl,
-        "avg_pnl":   avg_pnl,
-        "avg_win":   avg_win,
-        "avg_loss":  avg_loss,
-        "rr_real":   rr_real,
+        "total":         total,
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "timeouts":      len(timeouts),
+        "winrate":       len(wins) / total * 100,
+        "total_pnl":     total_pnl,
+        "avg_pnl":       avg_pnl,
+        "avg_win":       avg_win,
+        "avg_loss":      avg_loss,
+        "rr_real":       rr_real,
+        "profit_factor": profit_factor,
     }
 
 
@@ -415,13 +483,69 @@ def _vol_range(t: dict) -> str:
 
 def _rsi_range(t: dict) -> str:
     r = float(t.get("rsi_at_signal", 0))
-    if r < 40:
-        return "<40"
-    if r < 50:
-        return "40-50"
+    if r < 48:
+        return "<48"
+    if r < 52:
+        return "48-52"
+    if r < 56:
+        return "52-56"
     if r < 60:
-        return "50-60"
-    return ">60"
+        return "56-60"
+    if r < 64:
+        return "60-64"
+    if r < 68:
+        return "64-68"
+    return ">=68"
+
+
+def _spread_range(t: dict) -> str:
+    s = abs(float(t.get("ema_spread", 0)))
+    if s < 0.30:
+        return "<0.30"
+    if s < 0.50:
+        return "0.30-0.50"
+    if s < 0.65:
+        return "0.50-0.65"
+    if s < 0.80:
+        return "0.65-0.80"
+    if s < 1.00:
+        return "0.80-1.00"
+    return ">=1.00"
+
+
+def _body_range(t: dict) -> str:
+    b = float(t.get("body_ratio", 0))
+    if b < 0.45:
+        return "<0.45"
+    if b < 0.60:
+        return "0.45-0.60"
+    if b < 0.75:
+        return "0.60-0.75"
+    if b < 0.90:
+        return "0.75-0.90"
+    return ">=0.90"
+
+
+def _hour_range(t: dict) -> str:
+    try:
+        h = int(t.get("entry_time", "00:00")[-9:-7])
+    except (ValueError, IndexError):
+        return "unknown"
+    if h < 6:
+        return "00-06"
+    if h < 12:
+        return "06-12"
+    if h < 18:
+        return "12-18"
+    return "18-24"
+
+
+def _weekday_range(t: dict) -> str:
+    try:
+        dt = datetime.strptime(t.get("entry_time", "")[:10], "%Y-%m-%d")
+        return dt.strftime("%a")
+    except (ValueError, IndexError):
+        return "unknown"
 
 
 def _group_by(trades: list[dict], key_fn) -> dict[str, list[dict]]:
@@ -434,10 +558,9 @@ def _group_by(trades: list[dict], key_fn) -> dict[str, list[dict]]:
 
 # ── CSV output ────────────────────────────────────────────────────────────────
 
-def _save_csv(all_trades: list[dict]) -> str:
+def _save_csv(all_trades: list[dict], ts: str) -> str:
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
     os.makedirs(results_dir, exist_ok=True)
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(results_dir, f"backtest_{ts}.csv")
     if not all_trades:
         return path
@@ -449,15 +572,15 @@ def _save_csv(all_trades: list[dict]) -> str:
     return path
 
 
-def _save_analysis_csv(all_trades: list[dict]) -> str:
+def _save_analysis_csv(all_trades: list[dict], ts: str) -> str:
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
     os.makedirs(results_dir, exist_ok=True)
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(results_dir, f"analysis_{ts}.csv")
 
     fieldnames = [
         "categoria", "valor", "total_trades", "wins", "losses", "timeouts",
         "winrate", "total_pnl", "avg_pnl", "avg_win", "avg_loss", "rr_real",
+        "profit_factor",
     ]
 
     def _rows_for(categoria: str, groups: dict[str, list[dict]]) -> list[dict]:
@@ -465,22 +588,25 @@ def _save_analysis_csv(all_trades: list[dict]) -> str:
         for valor, trades in sorted(groups.items()):
             s = _compute_stats(trades)
             rows.append({
-                "categoria":    categoria,
-                "valor":        valor,
-                "total_trades": s["total"],
-                "wins":         s["wins"],
-                "losses":       s["losses"],
-                "timeouts":     s["timeouts"],
-                "winrate":      round(s["winrate"], 2),
-                "total_pnl":    round(s["total_pnl"], 4),
-                "avg_pnl":      round(s["avg_pnl"], 4),
-                "avg_win":      round(s["avg_win"], 4),
-                "avg_loss":     round(s["avg_loss"], 4),
-                "rr_real":      round(s["rr_real"], 3),
+                "categoria":     categoria,
+                "valor":         valor,
+                "total_trades":  s["total"],
+                "wins":          s["wins"],
+                "losses":        s["losses"],
+                "timeouts":      s["timeouts"],
+                "winrate":       round(s["winrate"], 2),
+                "total_pnl":     round(s["total_pnl"], 4),
+                "avg_pnl":       round(s["avg_pnl"], 4),
+                "avg_win":       round(s["avg_win"], 4),
+                "avg_loss":      round(s["avg_loss"], 4),
+                "rr_real":       round(s["rr_real"], 3),
+                "profit_factor": round(s["profit_factor"], 3),
             })
         return rows
 
     all_rows: list[dict] = []
+    all_rows += _rows_for("interval",
+                          _group_by(all_trades, lambda t: t["interval"]))
     all_rows += _rows_for("interval_side",
                           _group_by(all_trades, lambda t: f"{t['interval']}_{t['side']}"))
     all_rows += _rows_for("score_range",
@@ -493,11 +619,53 @@ def _save_analysis_csv(all_trades: list[dict]) -> str:
                           _group_by(all_trades, _vol_range))
     all_rows += _rows_for("rsi_at_signal",
                           _group_by(all_trades, _rsi_range))
+    all_rows += _rows_for("ema_spread",
+                          _group_by(all_trades, _spread_range))
+    all_rows += _rows_for("body_ratio",
+                          _group_by(all_trades, _body_range))
+    all_rows += _rows_for("hour_utc",
+                          _group_by(all_trades, _hour_range))
+    all_rows += _rows_for("weekday",
+                          _group_by(all_trades, _weekday_range))
 
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_rows)
+    return path
+
+
+def _save_equity_csv(all_trades: list[dict], ts: str) -> str:
+    """Save equity curve CSV with cumulative PnL and drawdown per trade."""
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    path = os.path.join(results_dir, f"equity_{ts}.csv")
+
+    fieldnames = ["trade_number", "entry_time", "symbol", "interval",
+                  "pnl_usdt", "cumulative_pnl", "peak", "drawdown"]
+
+    rows = []
+    cum_pnl = 0.0
+    peak    = 0.0
+    for n, t in enumerate(all_trades, start=1):
+        cum_pnl += t["pnl_usdt"]
+        peak     = max(peak, cum_pnl)
+        drawdown = cum_pnl - peak
+        rows.append({
+            "trade_number":  n,
+            "entry_time":    t.get("entry_time", ""),
+            "symbol":        t["symbol"],
+            "interval":      t["interval"],
+            "pnl_usdt":      round(t["pnl_usdt"], 4),
+            "cumulative_pnl": round(cum_pnl, 4),
+            "peak":          round(peak, 4),
+            "drawdown":      round(drawdown, 4),
+        })
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
     return path
 
 
@@ -509,8 +677,9 @@ def _print_report(
     skipped_low_score: int,
     csv_path: str,
     analysis_path: str,
+    equity_path: str,
 ) -> None:
-    SEP = "=" * 60
+    SEP = "=" * 65
 
     def _usd(v: float) -> str:
         return f"+${v:.2f}" if v >= 0 else f"-${abs(v):.2f}"
@@ -527,8 +696,9 @@ def _print_report(
                 continue
             s = _compute_stats(groups[k])
             print(
-                f"  {k:<20} | {s['total']:>5} trades | "
+                f"  {k:<22} | {s['total']:>5} trades | "
                 f"WR: {s['winrate']:>5.1f}% | "
+                f"PF: {s['profit_factor']:>4.2f} | "
                 f"PnL: {_usd(s['total_pnl'])}"
             )
 
@@ -539,15 +709,16 @@ def _print_report(
         print("  Sin trades.")
     else:
         be_wr = 1 / (1 + g["rr_real"]) * 100 if g["rr_real"] > 0 else 0.0
-        print(f"  Total trades : {g['total']}")
+        print(f"  Total trades   : {g['total']}")
         print(f"  Wins / Losses / Timeouts : {g['wins']} / {g['losses']} / {g['timeouts']}")
-        print(f"  Winrate      : {g['winrate']:.2f}%")
-        print(f"  PnL total    : {_usd(g['total_pnl'])}")
-        print(f"  Avg PnL      : {_usd(g['avg_pnl'])}")
-        print(f"  Avg WIN      : {_usd(g['avg_win'])}")
-        print(f"  Avg LOSS     : {_usd(g['avg_loss'])}")
-        print(f"  RR real      : {g['rr_real']:.2f}")
-        print(f"  WR breakeven : {be_wr:.1f}%")
+        print(f"  Winrate        : {g['winrate']:.2f}%")
+        print(f"  PnL total      : {_usd(g['total_pnl'])}")
+        print(f"  Avg PnL        : {_usd(g['avg_pnl'])}")
+        print(f"  Avg WIN        : {_usd(g['avg_win'])}")
+        print(f"  Avg LOSS       : {_usd(g['avg_loss'])}")
+        print(f"  RR real        : {g['rr_real']:.2f}")
+        print(f"  Profit Factor  : {g['profit_factor']:.2f}")
+        print(f"  WR breakeven   : {be_wr:.1f}%")
 
     # ── Section 2: By timeframe + side ───────────────────────────────────────
     _section("2. POR TIMEFRAME Y SIDE")
@@ -574,31 +745,116 @@ def _print_report(
 
     # ── Section 7: By RSI ─────────────────────────────────────────────────────
     _section("7. POR RSI EN SEÑAL")
-    _print_group(_group_by(all_trades, _rsi_range), ["<40", "40-50", "50-60", ">60"])
+    _print_group(_group_by(all_trades, _rsi_range),
+                 ["<48", "48-52", "52-56", "56-60", "60-64", "64-68", ">=68"])
 
     # ── Section 8: Top 5 best / worst symbols ────────────────────────────────
     _section("8. TOP 5 MEJORES Y PEORES PARES")
     sym_groups = _group_by(all_trades, lambda t: t["symbol"])
-    sym_stats = {sym: _compute_stats(ts) for sym, ts in sym_groups.items()}
-    by_pnl = sorted(sym_stats.items(), key=lambda x: x[1]["total_pnl"], reverse=True)
+    sym_stats  = {sym: _compute_stats(ts) for sym, ts in sym_groups.items()}
+    by_pnl     = sorted(sym_stats.items(), key=lambda x: x[1]["total_pnl"], reverse=True)
 
     print("  MEJORES:")
     for sym, s in by_pnl[:5]:
-        print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | PnL: {_usd(s['total_pnl'])}")
+        print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | "
+              f"PF: {s['profit_factor']:>4.2f} | PnL: {_usd(s['total_pnl'])}")
 
     print("  PEORES:")
     for sym, s in by_pnl[-5:]:
-        print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | PnL: {_usd(s['total_pnl'])}")
+        print(f"    {sym:<15} | {s['total']:>4} trades | WR: {s['winrate']:>5.1f}% | "
+              f"PF: {s['profit_factor']:>4.2f} | PnL: {_usd(s['total_pnl'])}")
 
     # ── Section 9: Discarded trades ───────────────────────────────────────────
     _section("9. TRADES DESCARTADOS")
     print(f"  4H SELL filtrados  : {skipped_4h_sell}")
     print(f"  Score < 1.0        : {skipped_low_score}")
 
-    # ── Section 10: Files generated ───────────────────────────────────────────
-    _section("10. ARCHIVOS GENERADOS")
+    # ── Section 10: Equity curve y drawdown ──────────────────────────────────
+    _section("10. EQUITY CURVE Y DRAWDOWN")
+    if all_trades:
+        cum_pnl    = 0.0
+        peak       = 0.0
+        max_dd      = 0.0
+        max_dd_time = ""
+        in_drawdown = False
+        dd_peak     = 0.0
+
+        max_cons_wins = max_cons_losses = 0
+        streak_w = streak_l = 0
+
+        for t in all_trades:
+            cum_pnl += t["pnl_usdt"]
+            peak     = max(peak, cum_pnl)
+            dd       = cum_pnl - peak
+            if dd < max_dd:
+                max_dd      = dd
+                max_dd_time = t.get("entry_time", "")
+                dd_peak     = peak
+                in_drawdown = True
+
+            if in_drawdown and cum_pnl >= dd_peak:
+                in_drawdown = False
+
+            # consecutive streaks
+            if t["result"] == "WIN":
+                streak_w += 1
+                streak_l  = 0
+            elif t["result"] == "LOSS":
+                streak_l += 1
+                streak_w  = 0
+            max_cons_wins   = max(max_cons_wins,  streak_w)
+            max_cons_losses = max(max_cons_losses, streak_l)
+
+        max_dd_pct = (max_dd / dd_peak * 100) if dd_peak > 0 else 0.0
+        calmar     = g["total_pnl"] / abs(max_dd) if max_dd != 0 else 0.0
+        recovered  = not in_drawdown
+
+        print(f"  Max drawdown (USDT)  : {_usd(max_dd)}")
+        print(f"  Max drawdown (%)     : {max_dd_pct:.2f}%")
+        print(f"  Drawdown en          : {max_dd_time}")
+        print(f"  Recuperado           : {'Sí' if recovered else 'No (abierto al final)'}")
+        print(f"  Calmar ratio         : {calmar:.2f}")
+        print(f"  Max cons. wins       : {max_cons_wins}")
+        print(f"  Max cons. losses     : {max_cons_losses}")
+
+    # ── Section 11: Frecuencia de trades ─────────────────────────────────────
+    _section("11. FRECUENCIA DE TRADES")
+    if all_trades:
+        days_count: dict[str, int] = {}
+        days_by_interval: dict[str, dict[str, int]] = {iv: {} for iv in INTERVALS}
+
+        for t in all_trades:
+            day = t.get("entry_time", "")[:10]
+            if not day:
+                continue
+            days_count[day] = days_count.get(day, 0) + 1
+            iv = t["interval"]
+            if iv in days_by_interval:
+                days_by_interval[iv][day] = days_by_interval[iv].get(day, 0) + 1
+
+        counts = sorted(days_count.values())
+        n_days = len(counts)
+        if n_days:
+            avg_trades = sum(counts) / n_days
+            med_idx    = n_days // 2
+            med_trades = counts[med_idx]
+            print(f"  Días con actividad   : {n_days}")
+            print(f"  Trades/día promedio  : {avg_trades:.1f}")
+            print(f"  Trades/día mediano   : {med_trades}")
+            print(f"  Trades/día mínimo    : {counts[0]}")
+            print(f"  Trades/día máximo    : {counts[-1]}")
+            print()
+            for iv in INTERVALS:
+                iv_counts = sorted(days_by_interval[iv].values())
+                if iv_counts:
+                    avg_iv = sum(iv_counts) / len(iv_counts)
+                    print(f"  {iv} → {avg_iv:.1f} trades/día promedio ({len(iv_counts)} días activos)")
+
+    # ── Section 12: Files generated ───────────────────────────────────────────
+    _section("12. ARCHIVOS GENERADOS")
     print(f"  Trades CSV   : {csv_path}")
     print(f"  Analysis CSV : {analysis_path}")
+    print(f"  Equity CSV   : {equity_path}")
     print()
 
 
@@ -614,20 +870,30 @@ def _get_client(api_key: str, api_secret: str) -> Client:
     return _thread_local.client
 
 
-def _process_task(
-    api_key: str, api_secret: str, sym: str, interval: str
-) -> tuple[str, str, list[dict], int, int, str | None]:
-    """Fetch klines and simulate trades for one (symbol, interval) pair."""
+def _download_one(args: tuple) -> tuple[str, str, pd.DataFrame | None, str | None]:
+    """Download klines for one (sym, interval). Used in Phase 1."""
+    sym, interval, api_key, api_secret = args
     client = _get_client(api_key, api_secret)
     limit = CANDLES_PER_INTERVAL[interval]
     try:
         df = _fetch_klines(client, sym, interval, limit)
+        if len(df) < 10:
+            return sym, interval, None, f"datos insuficientes ({len(df)} velas)"
+        return sym, interval, df, None
     except Exception as exc:
-        return sym, interval, [], 0, 0, f"error: {exc}"
-    if len(df) < 10:
-        return sym, interval, [], 0, 0, f"datos insuficientes ({len(df)} velas)"
+        return sym, interval, None, f"error: {exc}"
+
+
+# ── simulation task (top-level for pickle / ProcessPoolExecutor) ──────────────
+
+def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int]:
+    """Pickleable wrapper for ProcessPoolExecutor — Fase 2."""
+    df_dict, sym, interval = args
+    df = pd.DataFrame(df_dict)
+    df["open_time"]  = pd.to_datetime(df["open_time"],  utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
     trades, s4h, ssc = _simulate_trades(df, sym, interval)
-    return sym, interval, trades, s4h, ssc, None
+    return sym, interval, trades, s4h, ssc
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -646,30 +912,102 @@ def main() -> None:
         return
     print(f"Símbolos seleccionados: {len(symbols)}")
 
-    all_trades: list[dict] = []
-    total_skipped_4h_sell  = 0
-    total_skipped_low_score = 0
-    tasks = [(api_key, api_secret, sym, interval)
-             for sym in symbols for interval in INTERVALS]
-    total_tasks = len(tasks)
-    task_num = 0
+    download_tasks = [
+        (sym, interval, api_key, api_secret)
+        for sym in symbols for interval in INTERVALS
+    ]
+    total_dl = len(download_tasks)
 
-    print(f"Iniciando con {MAX_WORKERS} workers paralelos...")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_process_task, *t): t for t in tasks}
+    # ── Fase 1: Descarga paralela ─────────────────────────────────────────────
+    print(f"\nFase 1: Descargando {total_dl} datasets con {MAX_DL_WORKERS} workers...")
+    kline_data: dict[tuple[str, str], pd.DataFrame] = {}
+    dl_done = 0
+    dl_errors = 0
+    t0 = time.time()
+
+    with ThreadPoolExecutor(max_workers=MAX_DL_WORKERS) as executor:
+        futures = {executor.submit(_download_one, t): t for t in download_tasks}
         for future in as_completed(futures):
-            task_num += 1
-            sym, interval, trades, s4h, ssc, skip_reason = future.result()
-            if skip_reason:
-                print(f"  [SKIP] {sym} {interval}: {skip_reason} ({task_num}/{total_tasks})")
+            dl_done += 1
+            sym, interval, df, err = future.result()
+            if err:
+                dl_errors += 1
             else:
-                all_trades.extend(trades)
-                total_skipped_4h_sell  += s4h
-                total_skipped_low_score += ssc
-                print(f"  {sym} {interval} → {len(trades)} señales ({task_num}/{total_tasks})")
+                kline_data[(sym, interval)] = df  # type: ignore[index]
+            if dl_done % 100 == 0 or dl_done == total_dl:
+                elapsed   = time.time() - t0
+                rate      = dl_done / elapsed if elapsed > 0 else 1
+                remaining = (total_dl - dl_done) / rate if rate > 0 else 0
+                print(f"  Descargados: {dl_done}/{total_dl} | "
+                      f"{elapsed:.0f}s transcurridos | ~{remaining:.0f}s restantes | "
+                      f"{dl_errors} errores")
 
-    csv_path      = _save_csv(all_trades)
-    analysis_path = _save_analysis_csv(all_trades)
+    _dl_end = time.time()
+    print(f"Fase 1 completa: {len(kline_data)} datasets OK, {dl_errors} errores "
+          f"en {_dl_end - t0:.0f}s")
+
+    # ── Fase 2: Simulación paralela (CPU-bound → ProcessPoolExecutor) ─────────
+    all_trades: list[dict] = []
+    total_skipped_4h_sell   = 0
+    total_skipped_low_score = 0
+    total_sim = len(kline_data)
+    sim_done  = 0
+
+    print(f"\n{'=' * 60}")
+    print("  FASE 2: SIMULACIÓN DE TRADES")
+    print(f"{'=' * 60}")
+    print(f"  Usando {SIM_WORKERS} procesos paralelos")
+
+    # Serializar DataFrames a dicts para pickle eficiente
+    sim_args = []
+    for (sym, interval), df in kline_data.items():
+        df_send = df.copy()
+        df_send["open_time"]  = df_send["open_time"].astype(str)
+        df_send["close_time"] = df_send["close_time"].astype(str)
+        sim_args.append((df_send.to_dict("list"), sym, interval))
+    del kline_data  # liberar memoria
+
+    t1 = time.time()
+    with ProcessPoolExecutor(max_workers=SIM_WORKERS) as executor:
+        futures = {executor.submit(_simulate_task, args): (args[1], args[2])
+                   for args in sim_args}
+        for future in as_completed(futures):
+            sim_done += 1
+            try:
+                sym, interval, trades, s4h, ssc = future.result()
+                all_trades.extend(trades)
+                total_skipped_4h_sell   += s4h
+                total_skipped_low_score += ssc
+            except Exception as exc:
+                sym, interval = futures[future]
+                print(f"  [SIM ERROR] {sym} {interval}: {exc}")
+            if sim_done % 200 == 0 or sim_done == total_sim:
+                elapsed   = time.time() - t1
+                rate      = sim_done / elapsed if elapsed > 0 else 1
+                remaining = (total_sim - sim_done) / rate if rate > 0 else 0
+                print(f"  Simulados: {sim_done}/{total_sim} | "
+                      f"{elapsed:.0f}s | ~{remaining:.0f}s restantes")
+
+    del sim_args  # liberar memoria
+
+    _total = time.time() - t0
+    print(f"\n{'=' * 60}")
+    print("  RESUMEN DE EJECUCIÓN")
+    print(f"{'=' * 60}")
+    print(f"  Descarga:   {_dl_end - t0:.0f}s")
+    print(f"  Simulación: {time.time() - t1:.0f}s")
+    print(f"  TOTAL:      {_total:.0f}s ({_total / 60:.1f} min)")
+    print(f"  Trades generados: {len(all_trades)}")
+
+    # Sort chronologically before saving — ensures equity curve is meaningful
+    all_trades.sort(key=lambda t: t.get("entry_time", ""))
+
+    # Shared timestamp for all output files
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    csv_path      = _save_csv(all_trades, ts)
+    analysis_path = _save_analysis_csv(all_trades, ts)
+    equity_path   = _save_equity_csv(all_trades, ts)
 
     _print_report(
         all_trades,
@@ -677,6 +1015,7 @@ def main() -> None:
         total_skipped_low_score,
         csv_path,
         analysis_path,
+        equity_path,
     )
 
 
