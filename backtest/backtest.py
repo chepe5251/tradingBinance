@@ -283,18 +283,30 @@ def _simulate_trades(df: pd.DataFrame, symbol: str, interval: str) -> tuple[list
 
             if side == "BUY":
                 if c_high >= tp_price and c_low <= stop_price:
-                    result = "LOSS"; exit_price = stop_price; break
+                    result = "LOSS"
+                    exit_price = stop_price
+                    break
                 if c_high >= tp_price:
-                    result = "WIN"; exit_price = tp_price; break
+                    result = "WIN"
+                    exit_price = tp_price
+                    break
                 if c_low <= stop_price:
-                    result = "LOSS"; exit_price = stop_price; break
+                    result = "LOSS"
+                    exit_price = stop_price
+                    break
             else:  # SELL
                 if c_low <= tp_price and c_high >= stop_price:
-                    result = "LOSS"; exit_price = stop_price; break
+                    result = "LOSS"
+                    exit_price = stop_price
+                    break
                 if c_low <= tp_price:
-                    result = "WIN"; exit_price = tp_price; break
+                    result = "WIN"
+                    exit_price = tp_price
+                    break
                 if c_high >= stop_price:
-                    result = "LOSS"; exit_price = stop_price; break
+                    result = "LOSS"
+                    exit_price = stop_price
+                    break
 
         if side == "BUY":
             gross_pnl = (exit_price - entry_price) * qty
@@ -366,35 +378,49 @@ def _compute_stats(trades: list[dict]) -> dict:
 
 def _score_range(t: dict) -> str:
     s = float(t["score"])
-    if s < 1: return "0-1"
-    if s < 2: return "1-2"
-    if s < 3: return "2-3"
-    if s < 4: return "3-4"
+    if s < 1:
+        return "0-1"
+    if s < 2:
+        return "1-2"
+    if s < 3:
+        return "2-3"
+    if s < 4:
+        return "3-4"
     return "4+"
 
 
 def _hold_range(t: dict) -> str:
     h = int(t["candles_held"])
-    if h <= 5:  return "0-5"
-    if h <= 10: return "5-10"
-    if h <= 20: return "10-20"
-    if h <= 35: return "20-35"
+    if h <= 5:
+        return "0-5"
+    if h <= 10:
+        return "5-10"
+    if h <= 20:
+        return "10-20"
+    if h <= 35:
+        return "20-35"
     return "35+"
 
 
 def _vol_range(t: dict) -> str:
     v = float(t.get("vol_ratio", 0))
-    if v < 1.5: return "<1.5"
-    if v < 2.0: return "1.5-2.0"
-    if v < 3.0: return "2.0-3.0"
+    if v < 1.5:
+        return "<1.5"
+    if v < 2.0:
+        return "1.5-2.0"
+    if v < 3.0:
+        return "2.0-3.0"
     return ">3.0"
 
 
 def _rsi_range(t: dict) -> str:
     r = float(t.get("rsi_at_signal", 0))
-    if r < 40: return "<40"
-    if r < 50: return "40-50"
-    if r < 60: return "50-60"
+    if r < 40:
+        return "<40"
+    if r < 50:
+        return "40-50"
+    if r < 60:
+        return "50-60"
     return ">60"
 
 
