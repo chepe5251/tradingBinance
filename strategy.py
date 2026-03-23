@@ -97,7 +97,7 @@ def evaluate_signal(
     del (
         ema_trend, ema_fast, ema_mid, atr_avg_window, volume_avg_window,
         rsi_period, rsi_long_min, rsi_long_max, rsi_short_min, rsi_short_max,
-        volume_min_ratio, context_df,
+        volume_min_ratio,
     )
 
     if main_df.empty or len(main_df) < 230:
@@ -210,6 +210,26 @@ def evaluate_signal(
     if c_close <= s_high:
         return None
 
+    # ── HTF confirmation (context_df) ─────────────────────────────────────────
+    # Require the higher-timeframe trend to be bullish before entering long.
+    # If context data is absent or insufficient, allow the signal but apply a
+    # score penalty of 0.5 to reflect the lower confidence.
+    htf_bias = "NEUTRAL"
+    htf_penalty = 0.0
+    if not context_df.empty and len(context_df) >= EMA_SLOW:
+        ctx_ema50 = _ema(context_df["close"], EMA_MID).iloc[-1]
+        ctx_ema200 = _ema(context_df["close"], EMA_SLOW).iloc[-1]
+        ctx_price = float(context_df["close"].iloc[-1])
+        if ctx_ema50 == ctx_ema50 and ctx_ema200 == ctx_ema200:  # NaN check
+            if ctx_ema50 > ctx_ema200 and ctx_price > ctx_ema50:
+                htf_bias = "LONG"
+            else:
+                return None  # HTF trend not aligned with long entry
+        else:
+            htf_penalty = 0.5  # NaN indicators — reduce confidence
+    else:
+        htf_penalty = 0.5  # insufficient or missing context data
+
     # ── levels ────────────────────────────────────────────────────────────────
     stop_price = s_low - (0.1 * s_atr)
     risk       = entry_price - stop_price
@@ -222,7 +242,8 @@ def evaluate_signal(
     score = round(
         min(2.0, ((body_ratio - MIN_BODY_RATIO) / (1 - MIN_BODY_RATIO)) * 2)
         + (1.0 if (RSI_LONG_MIN + 5) < s_rsi < (RSI_LONG_MAX - 5) else 0)
-        + min(1.0, (spread_atr - MIN_EMA_SPREAD_ATR) * 2),
+        + min(1.0, (spread_atr - MIN_EMA_SPREAD_ATR) * 2)
+        - htf_penalty,
         2,
     )
 
@@ -238,6 +259,7 @@ def evaluate_signal(
         "rr_target":     RR_TARGET,
         "atr":           float(s_atr),
         "score":         score,
+        "htf_bias":      htf_bias,
         "strategy":      "ema_pullback_long",
         "confirm_m15":   (
             f"EMA20 pullback at {s_ema20:.4f} | "

@@ -91,6 +91,7 @@ class Settings:
     # Data
     history_candles_main: int = 600
     history_candles_context: int = 400
+    top_symbols_limit: int = 80
 
 
 def load_env(path: str = ".env") -> None:
@@ -242,6 +243,13 @@ def from_env() -> Settings:
     if log_every:
         try:
             settings.log_candle_every_sec = int(log_every)
+        except ValueError:
+            pass
+
+    top_limit = os.getenv("TOP_SYMBOLS_LIMIT")
+    if top_limit:
+        try:
+            settings.top_symbols_limit = max(1, int(top_limit))
         except ValueError:
             pass
 
