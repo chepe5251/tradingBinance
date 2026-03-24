@@ -8,7 +8,6 @@ import pytest
 from execution import FuturesExecutor, OrderRef
 from sizing import is_entry_size_valid
 
-
 # ── Shared fake exchange-info client ────────────────────────────────────────
 
 class _FakeClient:
