@@ -37,8 +37,8 @@ docker compose down
 ## 4. Health expectations
 Typical scheduler/heartbeat log pattern:
 ```text
-INFO | Scheduler init | symbols=80 intervals=['15m', '1h', '4h']
-INFO | Scheduler: polling 80 symbols x 3 intervals via REST
+INFO | Scheduler init | symbols=300 intervals=['15m', '1h']
+INFO | Scheduler: polling 300 symbols x 2 intervals via REST
 INFO | Heartbeat: bot alive | polls=... scheduler=True
 ```
 

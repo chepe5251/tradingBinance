@@ -54,4 +54,4 @@ Output CSV files are generated in `backtest/results/`.
 ## 5. Common checks
 - Missing API keys in live mode: bot fails fast at startup
 - Scheduler health: heartbeat updates `logs/.alive`
-- Symbol universe is controlled by `USE_TOP_VOLUME_SYMBOLS`, `TOP_VOLUME_SYMBOLS_COUNT`, `SYMBOLS`, `EXTRA_SYMBOLS`
+- Symbol universe: top **300** USDT perpetual symbols by 24h quote volume (hardcoded; cannot be changed via `.env`). Use `EXTRA_SYMBOLS` to add symbols on top, or `SYMBOLS` to override entirely.

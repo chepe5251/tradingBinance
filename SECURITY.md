@@ -19,7 +19,7 @@ Only disable these settings after verifying all configuration parameters produce
 | Risk | Mitigation |
 |------|-----------|
 | API key exposure | Use `.env`, never hardcode secrets, enable IP whitelist |
-| Runaway scaling | Set `SCALE_LEVEL*_MARGIN_USDT=0` to disable scaling levels |
+| Runaway scaling | `ENABLE_LOSS_SCALING=false` (default) disables DCA scaling; only enable after exhaustive backtest |
 | Network failure mid-trade | TP/SL orders are placed on-exchange and persist independently of the bot process |
 | Exchange rate limits | Chunked WebSocket streams and Telegram back-off are built-in |
 

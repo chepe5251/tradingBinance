@@ -8,7 +8,7 @@
 ## Key behavior
 - Uses the same `strategy.evaluate_signal(...)` logic as live runtime
 - Loads strategy and interval defaults from `config.py` via `.env`
-- Uses top-volume symbol selection (`TOP_VOLUME_SYMBOLS_COUNT`) unless explicit symbols are configured and top-volume mode is disabled
+- Symbol universe: top **300** USDT perpetual symbols by 24h quote volume (hardcoded in `config.py`)
 
 ## Run
 From repository root:
@@ -17,12 +17,13 @@ python backtest/backtest.py
 ```
 
 ## Core parameters
-- `TOP_SYMBOLS`: derived from `TOP_VOLUME_SYMBOLS_COUNT` / `TOP_SYMBOLS_LIMIT`
+- `TOP_SYMBOLS`: fixed at **300** (hardcoded; `TOP_VOLUME_SYMBOLS_COUNT` / `TOP_SYMBOLS_LIMIT` cannot be overridden via `.env`)
 - `INTERVALS`: derived from `MAIN_INTERVAL`, `CONTEXT_INTERVAL`, and higher timeframe map
 - `CANDLES_PER_INTERVAL`: derived from `HISTORY_CANDLES_MAIN` and `HISTORY_CANDLES_CONTEXT` with backtest-safe minimums
-- `MARGIN_PER_TRADE`: `FIXED_MARGIN_PER_TRADE_USDT`
+- `SIZING_MODE`: default `pct_balance` — each simulated trade uses `RISK_PER_TRADE_PCT` of the running balance as margin
 - `LEVERAGE`: `LEVERAGE`
 
 ## Notes
-- `4h` SELL trades are still blocked by simulation filter to mirror live behavior.
+- SELL trades are blocked on intervals listed in `BLOCK_SELL_ON_INTERVALS` (default `4h`) to mirror live long-only behavior.
+- `ENABLE_LOSS_SCALING=false` by default; DCA scaling is not applied during simulation unless explicitly enabled.
 - Rate limiter enforces Binance weight budget during parallel downloads.
