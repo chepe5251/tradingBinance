@@ -195,21 +195,20 @@ class EntryService:
                 sl = entry + risk_distance
                 tp = entry - (risk_distance * signal_rr)
             rr_value = abs(tp - entry) / abs(entry - sl) if entry != sl else 0.0
-            self.telegram.send(
-                format_signal_message(
-                    symbol=candidate.symbol,
-                    side=side,
-                    timeframe=signal.get("timeframe", interval.upper()),
-                    htf_bias=str(signal.get("htf_bias") or ("LONG" if side == "BUY" else "SHORT")),
-                    entry=entry,
-                    sl=sl,
-                    tp=tp,
-                    rr=rr_value,
-                    quality="A",
-                    volatility="Normal",
-                    structure=signal.get("strategy", "ob_bos").replace("_", " ").title(),
-                )
+            msg = format_signal_message(
+                symbol=candidate.symbol,
+                side=side,
+                timeframe=signal.get("timeframe", interval.upper()),
+                htf_bias=str(signal.get("htf_bias") or ("LONG" if side == "BUY" else "SHORT")),
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                rr=rr_value,
+                quality="A",
+                volatility="Normal",
+                structure=signal.get("strategy", "ob_bos").replace("_", " ").title(),
             )
+            threading.Thread(target=self.telegram.send, args=(msg,), daemon=True).start()
 
     def _entry_price_with_offset(self, side: str, market_price: float) -> float:
         if side == "BUY":
@@ -472,6 +471,7 @@ class EntryService:
             sl_atr=sl_atr,
             exec_type=exec_type,
             margin_to_use=margin_to_use,
+            max_hold_candles=self.settings.max_hold_candles,
         )
         threading.Thread(target=monitor.run, daemon=True).start()
         return True

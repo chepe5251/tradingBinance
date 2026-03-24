@@ -26,6 +26,12 @@ from indicators import atr_last, safe_mark_price
 from monitor_logic import evaluate_early_exit
 from risk import RiskManager
 
+_INTERVAL_SECONDS: dict[str, int] = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800,
+    "12h": 43200, "1d": 86400,
+}
+
 MONITOR_ERRORS = (
     BinanceAPIException,
     BinanceOrderException,
@@ -75,6 +81,7 @@ class PositionMonitor:
         sl_atr: float = 0.0,
         exec_type: str = "MARKET",
         margin_to_use: float = 0.0,
+        max_hold_candles: int = 50,
     ) -> None:
         self.executor = executor
         self.stream = stream
@@ -101,6 +108,7 @@ class PositionMonitor:
         self.sl_atr = sl_atr
         self.exec_type = exec_type
         self.margin_to_use = margin_to_use
+        self.max_hold_candles = max_hold_candles
 
     # ── Internal callbacks ───────────────────────────────────────────────────
 
@@ -434,6 +442,8 @@ class PositionMonitor:
         )
 
         # ── OCO monitor loop (breakeven → trailing → review → exit) ──────
+        interval_sec = _INTERVAL_SECONDS.get(self.interval, 900)
+        max_hold_sec = self.max_hold_candles * interval_sec if self.max_hold_candles > 0 else 0.0
         result, exit_price = self.executor.monitor_oco(
             tp_ref,
             sl_ref,
@@ -454,6 +464,7 @@ class PositionMonitor:
             review_fn=self._review_fn,
             review_sec=7,
             client_id_prefix=self.client_id_prefix,
+            max_hold_sec=max_hold_sec,
         )
 
         if result in {"TP", "SL"} or result.startswith("EARLY"):

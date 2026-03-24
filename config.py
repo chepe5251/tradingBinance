@@ -61,6 +61,10 @@ class Settings:
     min_risk_atr: float = 0.5
     max_risk_atr: float = 3.0
     min_score: float = 1.5
+    max_atr_avg_ratio: float = 2.5
+
+    # Hold timeout
+    max_hold_candles: int = 50
 
     # ATR-based management
     atr_sl_mult: float = 1.6
@@ -111,6 +115,9 @@ def load_env(path: str = ".env") -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
+            # Strip trailing inline comments (e.g. "0.05  # note" → "0.05")
+            if " #" in value:
+                value = value.split(" #")[0].rstrip()
             if key and key not in os.environ:
                 os.environ[key] = value
 
@@ -247,6 +254,9 @@ def from_env() -> Settings:
     _set_float(settings, "min_risk_atr", "MIN_RISK_ATR", minimum=0.0)
     _set_float(settings, "max_risk_atr", "MAX_RISK_ATR", minimum=0.0)
     _set_float(settings, "min_score", "MIN_SCORE", minimum=0.0)
+    _set_float(settings, "max_atr_avg_ratio", "MAX_ATR_AVG_RATIO", minimum=0.1)
+
+    _set_int(settings, "max_hold_candles", "MAX_HOLD_CANDLES", minimum=1)
 
     _set_float(settings, "atr_sl_mult", "ATR_SL_MULT", minimum=0.0)
     _set_float(settings, "atr_tp_mult", "ATR_TP_MULT", minimum=0.0)

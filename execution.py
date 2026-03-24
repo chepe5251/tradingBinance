@@ -655,6 +655,7 @@ class FuturesExecutor:
         review_fn: Optional[callable] = None,
         review_sec: int = 5,
         client_id_prefix: Optional[str] = None,
+        max_hold_sec: float = 0.0,
     ) -> tuple[str, float]:
         """Supervise TP/SL lifecycle until trade completion or early exit trigger.
 
@@ -664,6 +665,7 @@ class FuturesExecutor:
         """
         if self.paper:
             return "FILLED", entry_price or 0.0
+        start_ts = time.time()
         break_even = False
         current_entry = entry_price
         current_qty = qty
@@ -677,6 +679,20 @@ class FuturesExecutor:
         last_review = 0.0
 
         while True:
+            # ── Max hold timeout ─────────────────────────────────────────────
+            if max_hold_sec > 0 and time.time() - start_ts >= max_hold_sec:
+                if side and current_qty:
+                    try:
+                        self.close_position_market(side, current_qty)
+                    except EXCHANGE_ERRORS:
+                        pass
+                exit_p = 0.0
+                try:
+                    exit_p = float(price_fn()) if price_fn else float(current_entry or 0.0)
+                except Exception:
+                    exit_p = float(current_entry or 0.0)
+                return "EARLY:max_hold_timeout", exit_p
+
             # ── Loss-based scaling (disabled by default via scale_fn=None) ───
             if scale_fn and side and current_entry and current_qty and (current_tp is not None) and (current_sl is not None):
                 try:

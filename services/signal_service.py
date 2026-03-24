@@ -43,6 +43,7 @@ def _strategy_kwargs(settings: Settings) -> dict:
         "min_risk_atr": settings.min_risk_atr,
         "max_risk_atr": settings.max_risk_atr,
         "min_score": settings.min_score,
+        "max_atr_avg_ratio": settings.max_atr_avg_ratio,
     }
 
 

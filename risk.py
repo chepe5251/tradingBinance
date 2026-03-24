@@ -5,9 +5,11 @@ to in-memory state, which makes it safe to call on every candle close.
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -130,6 +132,43 @@ class RiskManager:
                 paused=self.state.paused,
                 loss_pause_until=self.state.loss_pause_until,
             )
+
+    def save(self, path: str) -> None:
+        """Persist RiskState to disk as JSON for restart recovery."""
+        with self._lock:
+            data = {
+                "consecutive_losses": self.state.consecutive_losses,
+                "last_trade_time": self.state.last_trade_time.isoformat() if self.state.last_trade_time else None,
+                "day_start_equity": self.state.day_start_equity,
+                "current_day": self.state.current_day.isoformat() if self.state.current_day else None,
+                "equity": self.state.equity,
+                "paused": self.state.paused,
+                "loss_pause_until": self.state.loss_pause_until.isoformat() if self.state.loss_pause_until else None,
+            }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def load(self, path: str) -> None:
+        """Restore RiskState from JSON if the file exists; silently ignores missing/corrupt files."""
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            with self._lock:
+                self.state.consecutive_losses = int(data.get("consecutive_losses", 0))
+                lt = data.get("last_trade_time")
+                self.state.last_trade_time = datetime.fromisoformat(lt) if lt else None
+                cd = data.get("current_day")
+                self.state.current_day = date.fromisoformat(cd) if cd else None
+                self.state.day_start_equity = float(data.get("day_start_equity", 0.0))
+                self.state.equity = float(data.get("equity", 0.0))
+                self.state.paused = bool(data.get("paused", False))
+                lpu = data.get("loss_pause_until")
+                self.state.loss_pause_until = datetime.fromisoformat(lpu) if lpu else None
+        except Exception:
+            pass  # corrupt or unreadable — start with fresh state
 
     def volatility_ok(self, df: pd.DataFrame) -> bool:
         """Check optional single-candle volatility guard."""

@@ -285,6 +285,7 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
             return executors[symbol]
 
     risk = _build_risk_manager(settings)
+    risk.load("logs/risk_state.json")
     if settings.use_paper_trading:
         risk.init_equity(settings.paper_start_balance)
     else:

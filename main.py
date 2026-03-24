@@ -104,6 +104,7 @@ def main() -> None:
             pass
         last_heartbeat = time.time()
 
+    runtime.risk.save("logs/risk_state.json")
     runtime.logger.info("Shutdown complete.")
     runtime.stream.stop()
 

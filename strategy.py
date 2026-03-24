@@ -31,6 +31,7 @@ def evaluate_signal(
     max_risk_atr: float = 3.0,
     min_score: float = 1.5,
     context_missing_penalty: float = 0.5,
+    max_atr_avg_ratio: float = 2.5,
 ) -> Optional[dict]:
     """Evaluate one symbol for a long setup.
 
@@ -176,6 +177,9 @@ def evaluate_signal(
     )
 
     atr_avg_ratio = s_atr / s_avg_atr if s_avg_atr > 0 else 1.0
+    if atr_avg_ratio > max_atr_avg_ratio:
+        return None
+
     return {
         "side": "BUY",
         "price": entry_price,
