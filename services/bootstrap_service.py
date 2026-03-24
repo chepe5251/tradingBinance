@@ -16,6 +16,7 @@ from config import Settings
 from data_stream import MarketDataStream
 from execution import FuturesExecutor
 from risk import RiskManager
+from services.exchange_metadata_service import ExchangeMetadataError, ExchangeMetadataService
 from services.operational_service import OperationalService
 from services.position_service import (
     PositionCache,
@@ -57,6 +58,7 @@ class RuntimeContext:
     evaluation_intervals: list[str]
     context_map: dict[str, str]
     operations: OperationalService
+    metadata_service: ExchangeMetadataService
 
 
 def setup_logging() -> tuple[logging.Logger, logging.Logger]:
@@ -232,6 +234,7 @@ def _build_stream(
         main_limit=main_limit,
         testnet=settings.data_use_testnet,
         extra_intervals=extra_intervals,
+        max_workers=settings.data_stream_max_workers,
     )
 
 
@@ -256,6 +259,11 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
     trade_client = configure_client(api_key, api_secret, settings.use_testnet)
     data_client = configure_client("", "", settings.data_use_testnet)
     position_cache = PositionCache(trade_client)
+    metadata_service = ExchangeMetadataService(trade_client, logger=logger)
+    try:
+        metadata_service.load()
+    except ExchangeMetadataError as exc:
+        logger.warning("metadata_load_failed err=%s", exc)
 
     symbols = load_symbol_universe(settings, data_client, logger)
     if not symbols:
@@ -279,6 +287,7 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
                     leverage=settings.leverage,
                     margin_type=settings.margin_type,
                     paper=settings.use_paper_trading,
+                    metadata_service=metadata_service,
                 )
                 executor.setup()
                 executors[symbol] = executor
@@ -345,4 +354,5 @@ def bootstrap_runtime(settings: Settings, api_key: str, api_secret: str) -> Runt
         evaluation_intervals=evaluation_intervals,
         context_map=context_map,
         operations=operations,
+        metadata_service=metadata_service,
     )

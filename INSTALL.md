@@ -1,4 +1,4 @@
-# Installation Guide
+﻿# Installation Guide
 
 ## Requirements
 - Python 3.11+
@@ -55,10 +55,14 @@ python main.py
 Logs:
 - Console runtime logs
 - `logs/trades.log`
-- `logs/risk_state.json` — persisted risk state, reloaded on restart
+- `logs/risk_state.json` - persisted risk state, reloaded on restart
 - `logs/ops_status.json` - operational snapshot (JSON)
 - `logs/ops_summary.md` - operational summary (markdown)
 - `logs/ops_state.json` - persisted operational counters
+
+Persistence notes:
+- state files are written atomically (`tmp + replace`)
+- corrupt JSON files are quarantined automatically as `*.bad-*`
 
 Operational snapshot includes:
 - health state (`healthy/degraded/paused`)
@@ -99,4 +103,6 @@ automatically via `pythonpath = ["."]`.
 - Scheduler health: heartbeat updates `logs/.alive`
 - Symbol universe: top **300** USDT perpetual symbols by 24h quote volume (hardcoded;
   `USE_TOP_VOLUME_SYMBOLS`, `EXTRA_SYMBOLS`, and `SYMBOLS` can filter/extend the set)
+- Stream workers: `DATA_STREAM_MAX_WORKERS` controls the fixed polling pool (default `20`)
 - Operational health: inspect `logs/ops_summary.md` for healthy/degraded/paused status
+

@@ -11,8 +11,11 @@ Trading bot for Binance USDT-M futures with:
 Main runtime modules:
 - `main.py`: orchestration only
 - `config.py`: settings + `.env` parser
-- `services/`: bootstrap, signal scan, entry flow, position helpers, telegram
-- `execution.py`, `monitor.py`, `risk.py`, `data_stream.py`
+- `services/runtime_controller.py`: lifecycle controller (`startup -> scheduler -> heartbeat -> shutdown`)
+- `services/bootstrap_service.py`: runtime wiring and startup dependencies
+- `services/exchange_metadata_service.py`: centralized exchange filter metadata cache
+- `services/`: signal scan, entry flow, position helpers, telegram, operational telemetry
+- `execution.py`, `monitor.py`, `monitor_runtime.py`, `monitor_protection.py`, `monitor_orphan.py`, `monitor_scaling.py`, `risk.py`, `data_stream.py`
 - `strategy.py`, `indicators.py`
 
 Run:
@@ -67,6 +70,9 @@ Generated periodically (default each 60s):
 
 State counters are persisted at shutdown in:
 - `logs/ops_state.json`
+
+Risk/operational state writes use atomic tmp+replace persistence. Corrupt JSON payloads are quarantined as
+`*.bad-*` so startup can continue safely.
 
 ### Kill Switches and Auto Suspension
 

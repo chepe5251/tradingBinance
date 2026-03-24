@@ -1,4 +1,4 @@
-"""Signal gating, entry execution, and monitor spawn flow."""
+﻿"""Signal gating, entry execution, and monitor spawn flow."""
 from __future__ import annotations
 
 import logging
@@ -16,6 +16,15 @@ from execution import FuturesExecutor
 from indicators import atr_last
 from monitor import PositionMonitor
 from risk import RiskManager
+from services.domain_models import (
+    EntryAttempt,
+    EntryFillResult,
+    EntryValidationResult,
+    LevelState,
+    MonitorLaunchContext,
+    TradePlan,
+    TradeState,
+)
 from services.position_service import PositionCache, count_active_positions, get_available_balance
 from services.signal_service import SignalCandidate, evaluate_interval_signals
 from services.telegram_service import TelegramService, format_signal_message
@@ -83,7 +92,7 @@ class EntryService:
             return
         try:
             getattr(self.operations, method)(**kwargs)
-        except Exception as exc:  # noqa: BLE001
+        except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
             # Operational telemetry must never block the trading flow.
             self.logger.debug("ops_hook_failed method=%s err=%s", method, exc)
 
@@ -104,21 +113,77 @@ class EntryService:
 
     def _on_close(self, interval: str) -> None:
         interval_state = self._interval_states[interval]
+        close_ms = self._resolve_interval_close(interval, interval_state)
+        if close_ms is None:
+            return
+
+        active_positions, symbols_with_positions = self._load_active_positions(interval)
+        if active_positions is None or symbols_with_positions is None:
+            return
+        has_open_position = active_positions >= self.settings.max_positions
+        can_trade_now = self.risk.can_trade(datetime.now(timezone.utc))
+
+        valid_signals = self._evaluate_signals(interval)
+        if not valid_signals:
+            return
+
+        self._record_detected_signals(valid_signals, interval, close_ms)
+        valid_signals = self._filter_signals_by_symbol_limit(
+            candidates=valid_signals,
+            symbols_with_positions=symbols_with_positions,
+            interval=interval,
+            active_positions=active_positions,
+        )
+        if not valid_signals:
+            return
+
+        execution_allowed, block_reason, live_count = self._resolve_execution_gate(
+            interval=interval,
+            can_trade_now=can_trade_now,
+            has_open_position=has_open_position,
+            active_positions=active_positions,
+        )
+
+        self._broadcast_signal_alerts(valid_signals, interval)
+
+        slots_available = max(0, self.settings.max_positions - live_count)
+        candidates = valid_signals[: max(1, slots_available)]
+        best_candidate = candidates[0]
+        if not execution_allowed:
+            self.trades_logger.info(
+                "signal_only tf=%s reason=%s total=%d",
+                interval,
+                block_reason or "BLOQUEADA",
+                len(valid_signals),
+            )
+            self._ops_call(
+                "record_signal_discarded",
+                reason=block_reason or "blocked",
+                symbol=best_candidate.symbol,
+                interval=interval,
+                trace_id=str(best_candidate.payload.get("trace_id") or ""),
+            )
+            return
+
+        if not self._execute_candidate(best_candidate, interval):
+            return
+        self._schedule_followup_if_needed(candidates, interval, interval_state)
+
+    def _resolve_interval_close(self, interval: str, interval_state: dict) -> int | None:
         anchor_symbol = self.symbols[0]
         anchor_df = self.stream.get_dataframe(anchor_symbol, interval)
         if anchor_df.empty:
-            return
+            return None
 
         close_time = anchor_df.iloc[-1]["close_time"]
         close_ms = int(close_time.timestamp() * 1000)
         with interval_state["lock"]:
             if interval_state["last_close_ms"] == close_ms:
-                return
+                return None
             interval_state["last_close_ms"] = close_ms
+        return close_ms
 
-        now = datetime.now(timezone.utc)
-        can_trade_now = self.risk.can_trade(now)
-
+    def _load_active_positions(self, interval: str) -> tuple[int | None, set[str] | None]:
         try:
             positions_snapshot = self.position_cache.get()
         except RECOVERABLE_ERRORS as exc:
@@ -130,13 +195,12 @@ class EntryService:
                 recoverable=True,
                 api_related=True,
             )
-            return
+            return None, None
+        return count_active_positions(positions_snapshot)
 
-        active_positions, symbols_with_positions = count_active_positions(positions_snapshot)
-        has_open_position = active_positions >= self.settings.max_positions
-
+    def _evaluate_signals(self, interval: str) -> list[SignalCandidate]:
         context_interval = self.context_map.get(interval)
-        valid_signals = evaluate_interval_signals(
+        return evaluate_interval_signals(
             stream=self.stream,
             symbols=self.symbols,
             interval=interval,
@@ -145,10 +209,14 @@ class EntryService:
             trades_logger=self.trades_logger,
             operations=self.operations,
         )
-        if not valid_signals:
-            return
 
-        for candidate in valid_signals:
+    def _record_detected_signals(
+        self,
+        candidates: list[SignalCandidate],
+        interval: str,
+        close_ms: int,
+    ) -> None:
+        for candidate in candidates:
             trace_id = str(candidate.payload.get("trace_id") or f"{candidate.symbol}-{interval}-{close_ms}")
             candidate.payload["trace_id"] = trace_id
             self._ops_call(
@@ -160,26 +228,40 @@ class EntryService:
                 trace_id=trace_id,
             )
 
-        pre_filter_candidates = list(valid_signals)
-        valid_signals = [
-            candidate for candidate in valid_signals if candidate.symbol not in symbols_with_positions
-        ]
-        if not valid_signals:
-            self.trades_logger.info(
-                "all_signals_skipped tf=%s reason=per_symbol_limit active=%d",
-                interval,
-                active_positions,
+    def _filter_signals_by_symbol_limit(
+        self,
+        *,
+        candidates: list[SignalCandidate],
+        symbols_with_positions: set[str],
+        interval: str,
+        active_positions: int,
+    ) -> list[SignalCandidate]:
+        filtered = [candidate for candidate in candidates if candidate.symbol not in symbols_with_positions]
+        if filtered:
+            return filtered
+        self.trades_logger.info(
+            "all_signals_skipped tf=%s reason=per_symbol_limit active=%d",
+            interval,
+            active_positions,
+        )
+        for candidate in candidates:
+            self._ops_call(
+                "record_signal_discarded",
+                reason="per_symbol_limit",
+                symbol=candidate.symbol,
+                interval=interval,
+                trace_id=str(candidate.payload.get("trace_id") or ""),
             )
-            for candidate in pre_filter_candidates:
-                self._ops_call(
-                    "record_signal_discarded",
-                    reason="per_symbol_limit",
-                    symbol=candidate.symbol,
-                    interval=interval,
-                    trace_id=str(candidate.payload.get("trace_id") or ""),
-                )
-            return
+        return []
 
+    def _resolve_execution_gate(
+        self,
+        *,
+        interval: str,
+        can_trade_now: bool,
+        has_open_position: bool,
+        active_positions: int,
+    ) -> tuple[bool, str, int]:
         execution_allowed = can_trade_now and not has_open_position
         block_reason = ""
         if has_open_position:
@@ -194,7 +276,7 @@ class EntryService:
         if execution_allowed:
             try:
                 live_positions = self.position_cache.get()
-                live_count, symbols_with_positions = count_active_positions(live_positions)
+                live_count, _ = count_active_positions(live_positions)
                 if live_count >= self.settings.max_positions:
                     execution_allowed = False
                     block_reason = (
@@ -222,42 +304,24 @@ class EntryService:
         if execution_allowed and not ops_allows_entries:
             execution_allowed = False
             block_reason = "BLOQUEADA POR SUSPENSION OPERATIVA"
+        return execution_allowed, block_reason, live_count
 
-        self._broadcast_signal_alerts(valid_signals, interval)
-
-        slots_available = max(0, self.settings.max_positions - live_count)
-        candidates = valid_signals[: max(1, slots_available)]
-        best_candidate = candidates[0]
-
-        if not execution_allowed:
-            self.trades_logger.info(
-                "signal_only tf=%s reason=%s total=%d",
-                interval,
-                block_reason or "BLOQUEADA",
-                len(valid_signals),
-            )
-            self._ops_call(
-                "record_signal_discarded",
-                reason=block_reason or "blocked",
-                symbol=best_candidate.symbol,
-                interval=interval,
-                trace_id=str(best_candidate.payload.get("trace_id") or ""),
-            )
+    def _schedule_followup_if_needed(
+        self,
+        candidates: list[SignalCandidate],
+        interval: str,
+        interval_state: dict,
+    ) -> None:
+        if len(candidates) <= 1:
             return
-
-        executed = self._execute_candidate(best_candidate, interval)
-        if not executed:
-            return
-
-        if len(candidates) > 1:
-            self.position_cache.invalidate()
-            with interval_state["lock"]:
-                interval_state["last_close_ms"] = None
-            threading.Thread(
-                target=lambda: self._on_close(interval),
-                daemon=True,
-                name=f"on_close_slot2_{interval}",
-            ).start()
+        self.position_cache.invalidate()
+        with interval_state["lock"]:
+            interval_state["last_close_ms"] = None
+        threading.Thread(
+            target=lambda: self._on_close(interval),
+            daemon=True,
+            name=f"on_close_slot2_{interval}",
+        ).start()
 
     def _broadcast_signal_alerts(self, candidates: list[SignalCandidate], interval: str) -> None:
         for candidate in candidates:
@@ -334,6 +398,37 @@ class EntryService:
             interval=interval,
             trace_id=trace_id,
         )
+
+        plan = self._build_trade_plan(candidate, interval, trace_id=trace_id)
+        if plan is None:
+            return False
+
+        validation = self._validate_trade_plan(plan)
+        if not validation.ok:
+            self._log_validation_failure(plan, validation)
+            self._mark_entry_failed(plan.symbol, validation.stage, validation.reason, trace_id=trace_id)
+            return False
+
+        fill = self._submit_entry(plan)
+        if not fill.success:
+            self._mark_entry_failed(plan.symbol, fill.stage, fill.reason, trace_id=trace_id)
+            return False
+
+        context = self._finalize_entry(plan, fill)
+        if context is None:
+            return False
+        self._launch_monitor(context)
+        return True
+
+    def _build_trade_plan(
+        self,
+        candidate: SignalCandidate,
+        interval: str,
+        trace_id: str,
+    ) -> TradePlan | None:
+        symbol = candidate.symbol
+        signal = candidate.payload
+        side = signal["side"]
         entry_price = self._entry_price_with_offset(side, float(signal["price"]))
         signal_risk = float(signal.get("risk_per_unit") or 0.0)
 
@@ -343,7 +438,7 @@ class EntryService:
         if atr_value <= 0:
             self.trades_logger.info("skip %s reason=atr_invalid", symbol)
             self._mark_entry_failed(symbol, "pre_entry", "atr_invalid", trace_id=trace_id)
-            return False
+            return None
 
         signal_rr = max(float(signal.get("rr_target") or 0.0), 1.8)
         risk_distance = signal_risk if signal_risk > 0 else max(
@@ -373,7 +468,7 @@ class EntryService:
                 trace_id=trace_id,
             )
             self._mark_entry_failed(symbol, "pre_entry", "balance_fetch_failed", trace_id=trace_id)
-            return False
+            return None
 
         executor: FuturesExecutor = self.get_executor(symbol)
         min_qty = executor.get_min_qty()
@@ -383,7 +478,7 @@ class EntryService:
         if entry_df.empty or len(entry_df) < 12:
             self.trades_logger.info("skip %s reason=entry_df_insufficient", symbol)
             self._mark_entry_failed(symbol, "pre_entry", "entry_df_insufficient", trace_id=trace_id)
-            return False
+            return None
 
         swing_window = entry_df.iloc[-10:-1]
         swing_low = float(swing_window["low"].min())
@@ -417,116 +512,177 @@ class EntryService:
                 available_balance,
             )
             self._mark_entry_failed(symbol, "sizing", "margin_to_use_invalid", trace_id=trace_id)
-            return False
+            return None
 
         qty_by_margin = executor.calc_qty(margin_to_use, entry_price)
         if qty_by_margin <= 0:
             self.trades_logger.info("skip %s reason=qty_by_margin_invalid", symbol)
             self._mark_entry_failed(symbol, "sizing", "qty_by_margin_invalid", trace_id=trace_id)
-            return False
+            return None
         qty_l1 = executor.round_qty(qty_by_margin)
 
+        return TradePlan(
+            symbol=symbol,
+            interval=interval,
+            side=side,
+            trace_id=trace_id,
+            signal=signal,
+            executor=executor,
+            entry_price=entry_price,
+            atr_value=atr_value,
+            signal_risk=signal_risk,
+            signal_rr=signal_rr,
+            risk_distance=risk_distance,
+            reward_distance=reward_distance,
+            sl=sl,
+            tp=tp,
+            entry_df_len=len(entry_df),
+            sl_swing=sl_swing,
+            sl_atr=sl_atr,
+            sl_common=sl_common,
+            available_balance=available_balance,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            margin_to_use=margin_to_use,
+            qty_by_margin=qty_by_margin,
+            qty_l1=qty_l1,
+        )
+
+    def _validate_trade_plan(self, plan: TradePlan) -> EntryValidationResult:
         # Keep liquidation-distance guard consistent with the effective sizing source:
         # - fixed_margin mode: use configured fixed margin
         # - other modes: use the actual computed margin_to_use for this entry
         margin_initial_ref = (
             float(self.settings.fixed_margin_per_trade_usdt)
             if self.settings.sizing_mode == SIZING_MODE_FIXED_MARGIN
-            else float(margin_to_use)
+            else float(plan.margin_to_use)
         )
-        if margin_initial_ref > 0 and qty_l1 > 0:
-            min_sl_distance_for_rebuy = (margin_initial_ref * 1.5) / qty_l1
-            if side == "BUY":
-                sl_required = entry_price - min_sl_distance_for_rebuy
-                if sl_common > sl_required:
-                    self.trades_logger.info(
-                        "skip %s reason=sl_inside_liquidation_zone sl_common=%.4f "
-                        "sl_required=%.4f entry=%.4f",
-                        symbol,
-                        sl_common,
-                        sl_required,
-                        entry_price,
+        if margin_initial_ref > 0 and plan.qty_l1 > 0:
+            min_sl_distance_for_rebuy = (margin_initial_ref * 1.5) / plan.qty_l1
+            if plan.side == "BUY":
+                sl_required = plan.entry_price - min_sl_distance_for_rebuy
+                if plan.sl_common > sl_required:
+                    return EntryValidationResult(
+                        ok=False,
+                        stage="sl_validation",
+                        reason="sl_inside_liquidation_zone",
                     )
-                    self._mark_entry_failed(
-                        symbol,
-                        "sl_validation",
-                        "sl_inside_liquidation_zone",
-                        trace_id=trace_id,
-                    )
-                    return False
             else:
-                sl_required = entry_price + min_sl_distance_for_rebuy
-                if sl_common < sl_required:
-                    self.trades_logger.info(
-                        "skip %s reason=sl_inside_liquidation_zone sl_common=%.4f "
-                        "sl_required=%.4f entry=%.4f",
-                        symbol,
-                        sl_common,
-                        sl_required,
-                        entry_price,
+                sl_required = plan.entry_price + min_sl_distance_for_rebuy
+                if plan.sl_common < sl_required:
+                    return EntryValidationResult(
+                        ok=False,
+                        stage="sl_validation",
+                        reason="sl_inside_liquidation_zone",
                     )
-                    self._mark_entry_failed(
-                        symbol,
-                        "sl_validation",
-                        "sl_inside_liquidation_zone",
-                        trace_id=trace_id,
-                    )
-                    return False
 
-        if not is_entry_size_valid(qty_l1, entry_price, min_qty, min_notional):
+        if not is_entry_size_valid(
+            plan.qty_l1,
+            plan.entry_price,
+            plan.min_qty,
+            plan.min_notional,
+        ):
+            return EntryValidationResult(
+                ok=False,
+                stage="validation",
+                reason="entry_notional_invalid",
+            )
+        return EntryValidationResult(ok=True, stage="ok", reason="")
+
+    def _log_validation_failure(self, plan: TradePlan, result: EntryValidationResult) -> None:
+        if result.reason == "sl_inside_liquidation_zone":
+            margin_initial_ref = (
+                float(self.settings.fixed_margin_per_trade_usdt)
+                if self.settings.sizing_mode == SIZING_MODE_FIXED_MARGIN
+                else float(plan.margin_to_use)
+            )
+            min_sl_distance_for_rebuy = (margin_initial_ref * 1.5) / plan.qty_l1 if plan.qty_l1 > 0 else 0.0
+            if plan.side == "BUY":
+                sl_required = plan.entry_price - min_sl_distance_for_rebuy
+            else:
+                sl_required = plan.entry_price + min_sl_distance_for_rebuy
+            self.trades_logger.info(
+                "skip %s reason=sl_inside_liquidation_zone sl_common=%.4f "
+                "sl_required=%.4f entry=%.4f",
+                plan.symbol,
+                plan.sl_common,
+                sl_required,
+                plan.entry_price,
+            )
+            return
+        if result.reason == "entry_notional_invalid":
             self.trades_logger.info(
                 "skip %s reason=entry_notional_invalid side=%s qty=%.6f entry=%.6f "
                 "min_qty=%.6f min_notional=%.4f",
-                symbol,
-                side,
-                qty_l1,
-                entry_price,
-                min_qty,
-                min_notional,
+                plan.symbol,
+                plan.side,
+                plan.qty_l1,
+                plan.entry_price,
+                plan.min_qty,
+                plan.min_notional,
             )
-            self._mark_entry_failed(symbol, "validation", "entry_notional_invalid", trace_id=trace_id)
-            return False
 
+    def _submit_entry(self, plan: TradePlan) -> EntryFillResult:
+        attempt = EntryAttempt(
+            symbol=plan.symbol,
+            interval=plan.interval,
+            side=plan.side,
+            qty=plan.qty_l1,
+            entry_price=plan.entry_price,
+            margin_to_use=plan.margin_to_use,
+            trace_id=plan.trace_id,
+        )
         self.trades_logger.info(
             "entry_attempt %s tf=%s side=%s qty=%.6f entry=%.6f margin=%.4f trace=%s",
-            symbol,
-            interval,
-            side,
-            qty_l1,
-            entry_price,
-            margin_to_use,
-            trace_id,
+            attempt.symbol,
+            attempt.interval,
+            attempt.side,
+            attempt.qty,
+            attempt.entry_price,
+            attempt.margin_to_use,
+            attempt.trace_id,
         )
         if not self._entry_lock.acquire(blocking=False):
-            self.trades_logger.info("signal_only tf=%s reason=entry_lock_busy sym=%s", interval, symbol)
-            self._mark_entry_failed(symbol, "entry_lock", "entry_lock_busy", trace_id=trace_id)
-            return False
+            self.trades_logger.info(
+                "signal_only tf=%s reason=entry_lock_busy sym=%s",
+                plan.interval,
+                plan.symbol,
+            )
+            return EntryFillResult(
+                success=False,
+                filled_qty=0.0,
+                avg_price=0.0,
+                exec_type="UNKNOWN",
+                stage="entry_lock",
+                reason="entry_lock_busy",
+            )
 
         filled_qty = 0.0
         avg_price = 0.0
         exec_type = "UNKNOWN"
         try:
-            if self._is_position_gate_blocked(symbol):
-                self._mark_entry_failed(
-                    symbol,
-                    "position_gate_recheck",
-                    "blocked",
-                    trace_id=trace_id,
+            if self._is_position_gate_blocked(plan.symbol):
+                return EntryFillResult(
+                    success=False,
+                    filled_qty=0.0,
+                    avg_price=0.0,
+                    exec_type="UNKNOWN",
+                    stage="position_gate_recheck",
+                    reason="blocked",
                 )
-                return False
 
             try:
-                self.trade_client.futures_cancel_all_open_orders(symbol=symbol)
+                self.trade_client.futures_cancel_all_open_orders(symbol=plan.symbol)
             except RECOVERABLE_ERRORS as exc:
-                self.logger.warning("pre_entry_cleanup_failed symbol=%s err=%s", symbol, exc)
+                self.logger.warning("pre_entry_cleanup_failed symbol=%s err=%s", plan.symbol, exc)
                 self._ops_call(
                     "record_error",
                     stage="pre_entry_cleanup",
                     err=exc,
-                    symbol=symbol,
+                    symbol=plan.symbol,
                     recoverable=True,
                     api_related=True,
-                    trace_id=trace_id,
+                    trace_id=plan.trace_id,
                 )
 
             try:
@@ -534,143 +690,173 @@ class EntryService:
                     "record_event",
                     kind="order_submit",
                     detail={
-                        "symbol": symbol,
-                        "side": side,
-                        "qty": qty_l1,
-                        "entry_price": entry_price,
+                        "symbol": plan.symbol,
+                        "side": plan.side,
+                        "qty": plan.qty_l1,
+                        "entry_price": plan.entry_price,
                     },
-                    trace_id=trace_id,
+                    trace_id=plan.trace_id,
                 )
                 filled_qty, avg_price, exec_type = self._place_entry(
-                    executor=executor,
-                    side=side,
-                    entry_price=entry_price,
-                    qty=qty_l1,
+                    executor=plan.executor,
+                    side=plan.side,
+                    entry_price=plan.entry_price,
+                    qty=plan.qty_l1,
                 )
             except RECOVERABLE_ERRORS as exc:
                 self.logger.error(
                     "order_placement_failed symbol=%s side=%s qty=%.6f entry=%.6f err=%s",
-                    symbol,
-                    side,
-                    qty_l1,
-                    entry_price,
+                    plan.symbol,
+                    plan.side,
+                    plan.qty_l1,
+                    plan.entry_price,
                     exc,
                 )
                 self._ops_call(
                     "record_error",
                     stage="order_placement",
                     err=exc,
-                    symbol=symbol,
+                    symbol=plan.symbol,
                     recoverable=True,
                     api_related=True,
-                    trace_id=trace_id,
+                    trace_id=plan.trace_id,
                 )
                 self.trades_logger.info(
                     "error %s stage=entry side=%s qty=%.6f entry=%.6f trace=%s msg=%s",
-                    symbol,
-                    side,
-                    qty_l1,
-                    entry_price,
-                    trace_id,
+                    plan.symbol,
+                    plan.side,
+                    plan.qty_l1,
+                    plan.entry_price,
+                    plan.trace_id,
                     exc,
                 )
-                self._mark_entry_failed(symbol, "order_placement", "exception", trace_id=trace_id)
-                return False
+                return EntryFillResult(
+                    success=False,
+                    filled_qty=0.0,
+                    avg_price=0.0,
+                    exec_type="UNKNOWN",
+                    stage="order_placement",
+                    reason="exception",
+                    error_message=str(exc),
+                )
         finally:
             self._entry_lock.release()
 
         if filled_qty <= 0:
-            self.trades_logger.info("skip %s reason=entry_not_filled", symbol)
-            self._mark_entry_failed(symbol, "order_fill", "entry_not_filled", trace_id=trace_id)
-            return False
+            self.trades_logger.info("skip %s reason=entry_not_filled", plan.symbol)
+            return EntryFillResult(
+                success=False,
+                filled_qty=0.0,
+                avg_price=0.0,
+                exec_type=exec_type,
+                stage="order_fill",
+                reason="entry_not_filled",
+            )
+        return EntryFillResult(
+            success=True,
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            exec_type=exec_type,
+        )
 
+    def _finalize_entry(self, plan: TradePlan, fill: EntryFillResult) -> MonitorLaunchContext | None:
         self.position_cache.invalidate()
-        entry_price = avg_price or entry_price
-        risk_distance = abs(entry_price - sl_common)
+        entry_price = fill.avg_price or plan.entry_price
+        risk_distance = abs(entry_price - plan.sl_common)
         if risk_distance <= 0:
-            self.trades_logger.info("skip %s reason=post_fill_risk_invalid", symbol)
-            self._mark_entry_failed(symbol, "post_fill", "post_fill_risk_invalid", trace_id=trace_id)
-            return False
+            self.trades_logger.info("skip %s reason=post_fill_risk_invalid", plan.symbol)
+            self._mark_entry_failed(
+                plan.symbol,
+                "post_fill",
+                "post_fill_risk_invalid",
+                trace_id=plan.trace_id,
+            )
+            return None
 
-        strategy_risk = float(signal.get("risk_per_unit") or 0.0)
+        strategy_risk = float(plan.signal.get("risk_per_unit") or 0.0)
         tp_risk_cap = strategy_risk if strategy_risk > 0 else risk_distance
         tp_risk_basis = min(risk_distance, tp_risk_cap)
         tp_rr_effective = max(float(self.settings.tp_rr), 1.8)
         tp = (
             entry_price + (tp_rr_effective * tp_risk_basis)
-            if side == "BUY"
+            if plan.side == "BUY"
             else entry_price - (tp_rr_effective * tp_risk_basis)
         )
         breakeven_trigger_pct_trade = (
             max((risk_distance * 0.3) / entry_price, 0.004) if entry_price > 0 else 0.004
         )
-        filled_qty = executor.round_qty(filled_qty)
+        filled_qty = plan.executor.round_qty(fill.filled_qty)
         self._ops_call(
             "record_entry_executed",
-            symbol=symbol,
-            side=side,
-            interval=interval,
+            symbol=plan.symbol,
+            side=plan.side,
+            interval=plan.interval,
             qty=filled_qty,
             entry=entry_price,
-            margin=margin_to_use,
-            exec_type=exec_type,
-            trace_id=trace_id,
+            margin=plan.margin_to_use,
+            exec_type=fill.exec_type,
+            trace_id=plan.trace_id,
         )
         self._ops_call("record_success", stage="entry_execution")
         self.trades_logger.info(
             "entry_executed %s tf=%s side=%s qty=%.6f entry=%.6f trace=%s",
-            symbol,
-            interval,
-            side,
+            plan.symbol,
+            plan.interval,
+            plan.side,
             filled_qty,
             entry_price,
-            trace_id,
+            plan.trace_id,
         )
 
-        trade_state = {
-            "entry_price": entry_price,
-            "qty": filled_qty,
-            "sl": sl_common,
-            "tp": tp,
-            "risk_distance": risk_distance,
-            "breakeven_trigger_pct": breakeven_trigger_pct_trade,
-            "anchor_entry_price": entry_price,
-            "anchor_risk_distance": risk_distance,
-            "tp_risk_cap": tp_risk_cap,
-            "trace_id": trace_id,
-        }
-        level_state = {
-            "loss_l1_done": False,
-            "loss_l2_done": False,
-            "loss_l3_done": False,
-            "loss_l1_attempts": 0,
-            "loss_l2_attempts": 0,
-            "loss_l3_attempts": 0,
-            "loss_l1_next_try_ts": 0.0,
-            "loss_l2_next_try_ts": 0.0,
-            "loss_l3_next_try_ts": 0.0,
-        }
+        trade_state = TradeState(
+            entry_price=entry_price,
+            qty=filled_qty,
+            sl=plan.sl_common,
+            tp=tp,
+            risk_distance=risk_distance,
+            breakeven_trigger_pct=breakeven_trigger_pct_trade,
+            anchor_entry_price=entry_price,
+            anchor_risk_distance=risk_distance,
+            tp_risk_cap=tp_risk_cap,
+            trace_id=plan.trace_id,
+        )
+        return MonitorLaunchContext(
+            symbol=plan.symbol,
+            side=plan.side,
+            interval=plan.interval,
+            trace_id=plan.trace_id,
+            plan=plan,
+            trade_state=trade_state,
+            level_state=LevelState(),
+            filled_qty=filled_qty,
+            entry_price=entry_price,
+            exec_type=fill.exec_type,
+        )
+
+    def _launch_monitor(self, context: MonitorLaunchContext) -> None:
+        plan = context.plan
+        symbol = context.symbol
 
         def price_fn() -> float | None:
             return safe_mark_price(self.trade_client, symbol, logger=self.logger)
 
         def atr_fn() -> float | None:
-            symbol_df = self.stream.get_dataframe(symbol, interval)
+            symbol_df = self.stream.get_dataframe(symbol, context.interval)
             return atr_last(symbol_df, self.settings.atr_period)
 
         def on_event(kind: str, new_sl: float) -> None:
             self.trades_logger.info("%s %s new_sl=%.4f", kind, symbol, new_sl)
 
         monitor = PositionMonitor(
-            executor=executor,
+            executor=plan.executor,
             stream=self.stream,
             settings=self.settings,
             risk=self.risk,
-            trade_state=trade_state,
-            level_state=level_state,
-            side=side,
+            trade_state=context.trade_state.to_dict(),
+            level_state=context.level_state.to_dict(),
+            side=context.side,
             symbol=symbol,
-            interval=interval,
+            interval=context.interval,
             client_id_prefix=f"{symbol}-{int(time.time() * 1000)}",
             logger=self.logger,
             trades_logger=self.trades_logger,
@@ -679,26 +865,25 @@ class EntryService:
             on_event=on_event,
             pos_cache_invalidate=self.position_cache.invalidate,
             risk_updater=self.risk.update_trade,
-            min_qty=min_qty,
-            min_notional=min_notional,
-            atr_val=atr_value,
-            signal=signal,
-            sl_swing=sl_swing,
-            sl_atr=sl_atr,
-            exec_type=exec_type,
-            margin_to_use=margin_to_use,
+            min_qty=plan.min_qty,
+            min_notional=plan.min_notional,
+            atr_val=plan.atr_value,
+            signal=plan.signal,
+            sl_swing=plan.sl_swing,
+            sl_atr=plan.sl_atr,
+            exec_type=context.exec_type,
+            margin_to_use=plan.margin_to_use,
             max_hold_candles=self.settings.max_hold_candles,
             operations=self.operations,
-            trace_id=trace_id,
+            trace_id=context.trace_id,
         )
         self._ops_call(
             "record_event",
             kind="monitor_started",
-            detail={"symbol": symbol, "interval": interval, "side": side},
-            trace_id=trace_id,
+            detail={"symbol": symbol, "interval": context.interval, "side": context.side},
+            trace_id=context.trace_id,
         )
-        threading.Thread(target=monitor.run, daemon=True).start()
-        return True
+        threading.Thread(target=monitor.run, daemon=True, name=f"monitor_{symbol}_{context.interval}").start()
 
     def _is_position_gate_blocked(self, symbol: str) -> bool:
         try:
@@ -768,3 +953,5 @@ class EntryService:
         filled_qty = float(order_payload.get("executedQty", qty) or qty or 0.0)
         avg_price = float(order_payload.get("avgPrice") or order_payload.get("price") or entry_price)
         return filled_qty, avg_price, "LIMIT_ONLY"
+
+

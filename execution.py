@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException, BinanceRequestException
@@ -25,6 +25,9 @@ EXCHANGE_ERRORS = (
 # Binance may return either variant depending on the endpoint and order version
 STOP_ORDER_TYPES: frozenset[str] = frozenset({"STOP", "STOP_MARKET"})
 TP_ORDER_TYPES: frozenset[str] = frozenset({"TAKE_PROFIT", "TAKE_PROFIT_MARKET"})
+
+if TYPE_CHECKING:
+    from services.exchange_metadata_service import ExchangeMetadataService
 
 
 @dataclass
@@ -48,13 +51,22 @@ class OrderRef:
 class FuturesExecutor:
     """Per-symbol execution helper with exchange-rule aware rounding."""
 
-    def __init__(self, client: Client, symbol: str, leverage: int, margin_type: str, paper: bool) -> None:
+    def __init__(
+        self,
+        client: Client,
+        symbol: str,
+        leverage: int,
+        margin_type: str,
+        paper: bool,
+        metadata_service: "ExchangeMetadataService | None" = None,
+    ) -> None:
         """Create an executor bound to a single symbol and account context."""
         self.client = client
         self.symbol = symbol
         self.leverage = leverage
         self.margin_type = margin_type
         self.paper = paper
+        self._metadata_service = metadata_service
         self._symbol_info = None
         self._step_size = None
         self._tick_size = None
@@ -81,6 +93,10 @@ class FuturesExecutor:
         """Load and cache exchange metadata for the configured symbol."""
         if self._symbol_info is not None:
             return self._symbol_info
+        if self._metadata_service is not None:
+            info = self._metadata_service.get_symbol_info(self.symbol)
+            self._symbol_info = info
+            return info
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == self.symbol:
@@ -91,6 +107,9 @@ class FuturesExecutor:
     def _get_step_size(self) -> float:
         """Return cached LOT_SIZE step for quantity rounding."""
         if self._step_size is not None:
+            return self._step_size
+        if self._metadata_service is not None:
+            self._step_size = self._metadata_service.get_step_size(self.symbol)
             return self._step_size
         symbol_info = self._get_symbol_info()
         for f in symbol_info["filters"]:
@@ -103,6 +122,9 @@ class FuturesExecutor:
         """Return cached PRICE_FILTER tick size for price rounding."""
         if self._tick_size is not None:
             return self._tick_size
+        if self._metadata_service is not None:
+            self._tick_size = self._metadata_service.get_tick_size(self.symbol)
+            return self._tick_size
         symbol_info = self._get_symbol_info()
         for f in symbol_info["filters"]:
             if f["filterType"] == "PRICE_FILTER":
@@ -113,6 +135,9 @@ class FuturesExecutor:
     def _get_price_limits(self) -> tuple[float, float]:
         """Return PRICE_FILTER min/max allowed prices."""
         if self._min_price is not None and self._max_price is not None:
+            return self._min_price, self._max_price
+        if self._metadata_service is not None:
+            self._min_price, self._max_price = self._metadata_service.get_price_limits(self.symbol)
             return self._min_price, self._max_price
         symbol_info = self._get_symbol_info()
         for f in symbol_info["filters"]:
@@ -128,6 +153,9 @@ class FuturesExecutor:
         """Return exchange minimum quantity for this symbol."""
         if self._min_qty is not None:
             return self._min_qty
+        if self._metadata_service is not None:
+            self._min_qty = self._metadata_service.get_min_qty(self.symbol)
+            return self._min_qty
         symbol_info = self._get_symbol_info()
         for f in symbol_info["filters"]:
             if f["filterType"] == "LOT_SIZE":
@@ -139,6 +167,9 @@ class FuturesExecutor:
     def get_min_notional(self) -> float:
         """Return exchange minimum notional requirement for this symbol."""
         if self._min_notional is not None:
+            return self._min_notional
+        if self._metadata_service is not None:
+            self._min_notional = self._metadata_service.get_min_notional(self.symbol)
             return self._min_notional
         symbol_info = self._get_symbol_info()
         for f in symbol_info["filters"]:

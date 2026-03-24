@@ -102,6 +102,7 @@ class Settings:
     # Data/history and logs
     history_candles_main: int = 600
     history_candles_context: int = 400
+    data_stream_max_workers: int = 20
     log_heartbeat_sec: int = 60
     log_candle_updates: bool = False
     log_candle_every_sec: int = 60
@@ -236,6 +237,7 @@ def from_env() -> Settings:
 
     _set_int(settings, "history_candles_main", "HISTORY_CANDLES_MAIN", minimum=120)
     _set_int(settings, "history_candles_context", "HISTORY_CANDLES_CONTEXT", minimum=120)
+    _set_int(settings, "data_stream_max_workers", "DATA_STREAM_MAX_WORKERS", minimum=1)
     _set_int(settings, "log_heartbeat_sec", "LOG_HEARTBEAT_SEC", minimum=5)
     _set_bool(settings, "log_candle_updates", "LOG_CANDLE_UPDATES")
     _set_int(settings, "log_candle_every_sec", "LOG_CANDLE_EVERY_SEC", minimum=5)

@@ -53,6 +53,8 @@ Operational status is written to:
 - `logs/ops_summary.md`
 - `logs/ops_state.json` (saved on clean shutdown)
 
+State persistence is atomic (`tmp + replace`) and corrupt JSON files are quarantined as `*.bad-*`.
+
 `ops_status.json` includes metrics (`signals_detected`, `signals_rejected`,
 `entries_attempted`, `entries_executed`, `entries_failed`, `protection_failures`,
 `order_failures`, `orphan_recoveries`, `heartbeat_count`, `polling_cycles`) plus
@@ -71,3 +73,6 @@ correctly, without echoing any API keys or secrets.
 - `ENABLE_OPERATIONAL_KILL_SWITCHES=false` by default (no entry gating changes unless enabled).
 - `KILL_SWITCH_MAX_API_ERRORS=0` by default (no API degradation suspension unless configured).
 - `ENABLE_OPERATIONAL_ALERTS=false` by default (avoid Telegram operational noise unless needed).
+- `DATA_STREAM_MAX_WORKERS=20` uses a fixed worker pool; increase only if VPS resources allow it.
+- Scanning the default top 300 symbols is resource-intensive; tune with `TOP_VOLUME_MIN_QUOTE_VOLUME`,
+  `TOP_VOLUME_MIN_PRICE`, `SYMBOLS`, and `EXTRA_SYMBOLS` if needed.

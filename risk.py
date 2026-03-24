@@ -5,13 +5,16 @@ to in-memory state, which makes it safe to call on every candle close.
 """
 from __future__ import annotations
 
-import json
-import os
+import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+
+from persistence import atomic_write_json, load_json_safe
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -145,17 +148,20 @@ class RiskManager:
                 "paused": self.state.paused,
                 "loss_pause_until": self.state.loss_pause_until.isoformat() if self.state.loss_pause_until else None,
             }
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
+        atomic_write_json(path, data)
 
     def load(self, path: str) -> None:
-        """Restore RiskState from JSON if the file exists; silently ignores missing/corrupt files."""
-        if not os.path.exists(path):
+        """Restore RiskState from JSON if it exists, tolerating corruption."""
+        data = load_json_safe(
+            path,
+            on_corrupt=lambda err: logger.warning(
+                "risk_state_corrupt path=%s err=%s (moved to .bad)", path, err
+            ),
+        )
+        if not data:
             return
+
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
             with self._lock:
                 self.state.consecutive_losses = int(data.get("consecutive_losses", 0))
                 lt = data.get("last_trade_time")
@@ -167,10 +173,8 @@ class RiskManager:
                 self.state.paused = bool(data.get("paused", False))
                 lpu = data.get("loss_pause_until")
                 self.state.loss_pause_until = datetime.fromisoformat(lpu) if lpu else None
-        except Exception:
-            # Broad catch: JSON may be corrupt, truncated, or from an incompatible schema.
-            # Silently fall back to fresh state rather than aborting startup.
-            pass
+        except (TypeError, ValueError) as exc:
+            logger.warning("risk_state_invalid_payload path=%s err=%s", path, exc)
 
     def volatility_ok(self, df: pd.DataFrame) -> bool:
         """Check optional single-candle volatility guard."""

@@ -7,13 +7,13 @@ This module is intentionally strategy-agnostic:
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+
+from persistence import atomic_write_json, atomic_write_text, load_json_safe
 
 if TYPE_CHECKING:
     import logging
@@ -161,12 +161,15 @@ class OperationalService:
 
     def load_state(self, path: str) -> None:
         """Load counters from disk to preserve long-running paper diagnostics."""
-        if not path or not os.path.exists(path):
+        if not path:
             return
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError, TypeError):
+        data = load_json_safe(
+            path,
+            on_corrupt=lambda err: self.logger.warning(
+                "ops_state_corrupt path=%s err=%s (moved to .bad)", path, err
+            ),
+        )
+        if not data:
             return
 
         with self._lock:
@@ -786,16 +789,12 @@ class OperationalService:
 
     def _write_json(self, path: str, payload: dict[str, Any]) -> None:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=True, indent=2)
+            atomic_write_json(path, payload)
         except OSError as exc:
             self.logger.warning("ops_status_write_failed path=%s err=%s", path, exc)
 
     def _write_text(self, path: str, content: str) -> None:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(content)
+            atomic_write_text(path, content)
         except OSError as exc:
             self.logger.warning("ops_summary_write_failed path=%s err=%s", path, exc)

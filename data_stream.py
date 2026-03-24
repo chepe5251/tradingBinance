@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Callable, Dict, Optional
 
 import pandas as pd
@@ -44,6 +45,7 @@ class MarketDataStream:
         context_interval: str | None = None,
         context_limit: int | None = None,
         extra_intervals: dict[str, int] | None = None,
+        max_workers: int = 20,
     ) -> None:
         """Initialize stream configuration and caches without opening connections."""
         self.client = client
@@ -55,6 +57,7 @@ class MarketDataStream:
         self.symbols = [s.upper() for s in symbols]
         self.main_interval = main_interval
         self.main_limit = main_limit
+        self.max_workers = max(1, int(max_workers))
 
         self._lock = threading.Lock()
         self._candles: Dict[str, Dict[str, deque]] = {
@@ -77,6 +80,11 @@ class MarketDataStream:
         self._last_poll_duration_sec: float = 0.0
         self._stop_event = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
+        self._pool_lock = threading.Lock()
+        self._pool: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix="md-poll",
+        )
 
     def load_initial(self) -> None:
         """Hydrate each cache with historical klines before streaming starts."""
@@ -164,21 +172,40 @@ class MarketDataStream:
                     series.append(row)
 
     def _refresh_all(self) -> None:
-        """Fetch latest candles for every symbol/interval in parallel (max 20 concurrent)."""
-        semaphore = threading.Semaphore(20)
-        threads: list[threading.Thread] = []
+        """Fetch latest candles for every symbol/interval via fixed worker pool."""
+        tasks: list[tuple[str, str]] = [
+            (symbol, interval)
+            for interval in list(self._candles.keys())
+            for symbol in self.symbols
+        ]
+        if not tasks:
+            return
 
-        for interval in list(self._candles.keys()):
-            for sym in self.symbols:
-                def _task(s: str = sym, iv: str = interval) -> None:
-                    with semaphore:
-                        self._fetch_and_update(s, iv)
-                t = threading.Thread(target=_task, daemon=True)
-                t.start()
-                threads.append(t)
+        pool = self._ensure_pool()
+        futures: list[Future[None]] = [
+            pool.submit(self._fetch_and_update, symbol, interval)
+            for symbol, interval in tasks
+        ]
+        done, pending = wait(futures, timeout=35)
+        for future in done:
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                # Keep broad catch: worker exceptions should not abort scheduler loop.
+                logger.debug("poll_worker_failed err=%s", exc)
+        if pending:
+            logger.warning("poll_worker_timeout pending=%d", len(pending))
+            for future in pending:
+                future.cancel()
 
-        for t in threads:
-            t.join(timeout=30)
+    def _ensure_pool(self) -> ThreadPoolExecutor:
+        with self._pool_lock:
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(
+                    max_workers=self.max_workers,
+                    thread_name_prefix="md-poll",
+                )
+            return self._pool
 
     def _scheduler_loop(self) -> None:
         """Core loop: sleep until next M15 boundary, refresh REST data, fire callback."""
@@ -233,8 +260,14 @@ class MarketDataStream:
         self._scheduler_thread.start()
 
     def stop(self) -> None:
-        """Stop the scheduler."""
+        """Stop the scheduler and release worker resources."""
         self._stop_event.set()
+        if self._scheduler_thread and self._scheduler_thread.is_alive():
+            self._scheduler_thread.join(timeout=5)
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+                self._pool = None
 
     def restart_if_stale(self, max_idle_sec: int) -> None:
         """Legacy no-op kept for API compatibility.
