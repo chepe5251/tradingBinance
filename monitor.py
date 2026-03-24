@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException, BinanceRequestException
 
-from execution import FuturesExecutor, STOP_ORDER_TYPES, TP_ORDER_TYPES
+from execution import STOP_ORDER_TYPES, TP_ORDER_TYPES, FuturesExecutor
 from indicators import atr_last, safe_mark_price
 from monitor_logic import evaluate_early_exit
 from risk import RiskManager

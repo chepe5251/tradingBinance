@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 
-from sizing import PositionSizer, SizingInputs, SIZING_MODE_PCT_BALANCE, normalize_sizing_mode
+from sizing import SIZING_MODE_PCT_BALANCE, PositionSizer, SizingInputs, normalize_sizing_mode
 
 
 def _make_inputs(**overrides) -> SizingInputs:
