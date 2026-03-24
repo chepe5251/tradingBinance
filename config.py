@@ -39,7 +39,7 @@ class Settings:
     # Sizing and position control
     sizing_mode: str = SIZING_MODE_PCT_BALANCE
     fixed_margin_per_trade_usdt: float = 5.0
-    risk_per_trade_pct: float = 0.05  # 5% of available balance per position
+    risk_per_trade_pct: float = 0.01  # 1% of available balance per position
     margin_utilization: float = 0.95
     max_positions: int = 2
     use_limit_only: bool = False
