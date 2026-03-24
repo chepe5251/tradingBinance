@@ -19,6 +19,7 @@ from services.position_service import PositionCache, count_active_positions, get
 from services.signal_service import SignalCandidate, evaluate_interval_signals
 from services.telegram_service import TelegramService, format_signal_message
 from sizing import (
+    SIZING_MODE_FIXED_MARGIN,
     PositionSizer,
     SizingInputs,
     is_entry_size_valid,
@@ -303,7 +304,14 @@ class EntryService:
             return False
         qty_l1 = executor.round_qty(qty_by_margin)
 
-        margin_initial_ref = float(self.settings.fixed_margin_per_trade_usdt)
+        # Keep liquidation-distance guard consistent with the effective sizing source:
+        # - fixed_margin mode: use configured fixed margin
+        # - other modes: use the actual computed margin_to_use for this entry
+        margin_initial_ref = (
+            float(self.settings.fixed_margin_per_trade_usdt)
+            if self.settings.sizing_mode == SIZING_MODE_FIXED_MARGIN
+            else float(margin_to_use)
+        )
         if margin_initial_ref > 0 and qty_l1 > 0:
             min_sl_distance_for_rebuy = (margin_initial_ref * 1.5) / qty_l1
             if side == "BUY":

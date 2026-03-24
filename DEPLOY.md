@@ -38,7 +38,7 @@ docker compose down
 
 Typical startup log pattern (verify your `.env` here — no secrets exposed):
 ```text
-INFO | Startup | mode=LIVE leverage=20x sizing=pct_balance pct=5% max_pos=2 symbols=300 intervals=['15m', '1h', '4h'] hold=50 candles
+INFO | Startup | mode=LIVE leverage=20x sizing=pct_balance pct=1% max_pos=2 symbols=300 intervals=['15m', '1h', '4h'] hold=50 candles
 INFO | Strategy config | ema=20/50/200 atr=14 rsi=48-68 vol=1.05-1.50x body>=0.35 score>=1.5 rr=2.0
 INFO | Loaded 300 symbols by top-volume filter.
 INFO | Starting scheduler symbols=300 intervals=['15m', '1h', '4h']
