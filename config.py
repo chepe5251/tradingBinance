@@ -16,13 +16,13 @@ class Settings:
     symbols: list[str] = field(default_factory=list)
     extra_symbols: list[str] = field(default_factory=list)
     use_top_volume_symbols: bool = True
-    top_volume_symbols_count: int = 80
+    top_volume_symbols_count: int = 300
     top_volume_allowlist: list[str] = field(default_factory=list)
     top_volume_min_price: float = 0.0
     top_volume_min_quote_volume: float = 0.0
     main_interval: str = "15m"
     context_interval: str = "1h"
-    top_symbols_limit: int = 80  # legacy alias used as fallback
+    top_symbols_limit: int = 300  # legacy alias used as fallback
 
     # Exchange/account
     leverage: int = 20
