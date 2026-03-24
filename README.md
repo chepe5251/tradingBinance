@@ -185,13 +185,46 @@ pip install ruff==0.4.4
 ruff check .
 ```
 
-## Backtest
+## Backtest & Analysis (Stage 2)
+
+> **Stage 2 adds validation and robustness tooling. It does NOT change leverage,
+> sizing, exposure, or any production behaviour.**
+
+### Standard backtest
 
 ```bash
 python backtest/backtest.py
 ```
 
 Uses the same `StrategyConfig` as the live runtime. Results written to `backtest/results/`.
+The console report now includes: expectancy, median PnL, best/worst trade, and top-winner concentration.
+
+### Walk-forward analysis
+
+Tests temporal consistency — are results stable across time periods?
+
+```bash
+python backtest/walk_forward.py \
+    --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
+    --window 30 --step 15
+```
+
+### Out-of-sample validation
+
+Splits a backtest into in-sample (IS) and out-of-sample (OOS) periods:
+
+```bash
+python backtest/oos_split.py \
+    --csv backtest/results/backtest_YYYYMMDD_HHMMSS.csv \
+    --split 2026-03-01   # or --pct 0.7
+```
+
+### Market regime & filter analysis
+
+The `analysis_*.csv` output now includes `median_pnl`, `expectancy`, `best_trade`, and
+`worst_trade` per segment. Filter rows where `profit_factor < 1.0` to identify weak segments.
+
+See [backtest/README.md](backtest/README.md) for full documentation on all Stage 2 tools.
 
 ## Docker
 

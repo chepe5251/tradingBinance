@@ -39,6 +39,7 @@ from __future__ import annotations
 import csv
 import multiprocessing
 import os
+import statistics
 import sys
 import threading
 import time
@@ -458,33 +459,44 @@ def _compute_stats(trades: list[dict]) -> dict:
         return {
             "total": 0, "wins": 0, "losses": 0, "timeouts": 0,
             "winrate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
-            "avg_win": 0.0, "avg_loss": 0.0, "rr_real": 0.0,
-            "profit_factor": 0.0,
+            "median_pnl": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
+            "rr_real": 0.0, "profit_factor": 0.0,
+            "expectancy": 0.0, "best_trade": 0.0, "worst_trade": 0.0,
         }
     wins     = [t for t in trades if t["result"] == "WIN"]
     losses   = [t for t in trades if t["result"] == "LOSS"]
     timeouts = [t for t in trades if t["result"] == "TIMEOUT"]
     total    = len(trades)
-    total_pnl    = sum(t["pnl_usdt"] for t in trades)
+    pnls         = [t["pnl_usdt"] for t in trades]
+    total_pnl    = sum(pnls)
     avg_pnl      = total_pnl / total
+    median_pnl   = statistics.median(pnls)
+    best_trade   = max(pnls)
+    worst_trade  = min(pnls)
     avg_win      = sum(t["pnl_usdt"] for t in wins)   / len(wins)   if wins   else 0.0
     avg_loss     = sum(t["pnl_usdt"] for t in losses) / len(losses) if losses else 0.0
     rr_real      = avg_win / abs(avg_loss) if losses and avg_loss != 0 else 0.0
-    gross_profit = sum(t["pnl_usdt"] for t in trades if t["pnl_usdt"] > 0)
-    gross_loss   = abs(sum(t["pnl_usdt"] for t in trades if t["pnl_usdt"] < 0))
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss   = abs(sum(p for p in pnls if p < 0))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
+    winrate_frac  = len(wins) / total
+    expectancy    = winrate_frac * avg_win + (1.0 - winrate_frac) * avg_loss
     return {
         "total":         total,
         "wins":          len(wins),
         "losses":        len(losses),
         "timeouts":      len(timeouts),
-        "winrate":       len(wins) / total * 100,
+        "winrate":       winrate_frac * 100,
         "total_pnl":     total_pnl,
         "avg_pnl":       avg_pnl,
+        "median_pnl":    median_pnl,
         "avg_win":       avg_win,
         "avg_loss":      avg_loss,
         "rr_real":       rr_real,
         "profit_factor": profit_factor,
+        "expectancy":    expectancy,
+        "best_trade":    best_trade,
+        "worst_trade":   worst_trade,
     }
 
 
@@ -623,8 +635,8 @@ def _save_analysis_csv(all_trades: list[dict], ts: str) -> str:
 
     fieldnames = [
         "categoria", "valor", "total_trades", "wins", "losses", "timeouts",
-        "winrate", "total_pnl", "avg_pnl", "avg_win", "avg_loss", "rr_real",
-        "profit_factor",
+        "winrate", "total_pnl", "avg_pnl", "median_pnl", "avg_win", "avg_loss",
+        "rr_real", "profit_factor", "expectancy", "best_trade", "worst_trade",
     ]
 
     def _rows_for(categoria: str, groups: dict[str, list[dict]]) -> list[dict]:
@@ -641,10 +653,14 @@ def _save_analysis_csv(all_trades: list[dict], ts: str) -> str:
                 "winrate":       round(s["winrate"], 2),
                 "total_pnl":     round(s["total_pnl"], 4),
                 "avg_pnl":       round(s["avg_pnl"], 4),
+                "median_pnl":    round(s["median_pnl"], 4),
                 "avg_win":       round(s["avg_win"], 4),
                 "avg_loss":      round(s["avg_loss"], 4),
                 "rr_real":       round(s["rr_real"], 3),
                 "profit_factor": round(s["profit_factor"], 3),
+                "expectancy":    round(s["expectancy"], 4),
+                "best_trade":    round(s["best_trade"], 4),
+                "worst_trade":   round(s["worst_trade"], 4),
             })
         return rows
 
@@ -758,6 +774,10 @@ def _print_report(
         print(f"  Winrate        : {g['winrate']:.2f}%")
         print(f"  PnL total      : {_usd(g['total_pnl'])}")
         print(f"  Avg PnL        : {_usd(g['avg_pnl'])}")
+        print(f"  Median PnL     : {_usd(g['median_pnl'])}")
+        print(f"  Expectancy     : {_usd(g['expectancy'])}")
+        print(f"  Best trade     : {_usd(g['best_trade'])}")
+        print(f"  Worst trade    : {_usd(g['worst_trade'])}")
         print(f"  Avg WIN        : {_usd(g['avg_win'])}")
         print(f"  Avg LOSS       : {_usd(g['avg_loss'])}")
         print(f"  RR real        : {g['rr_real']:.2f}")
@@ -894,8 +914,29 @@ def _print_report(
                     avg_iv = sum(iv_counts) / len(iv_counts)
                     print(f"  {iv} → {avg_iv:.1f} trades/día promedio ({len(iv_counts)} días activos)")
 
-    # ── Section 12: Files generated ───────────────────────────────────────────
-    _section("12. ARCHIVOS GENERADOS")
+    # ── Section 12: Top-winner concentration ─────────────────────────────────
+    _section("12. CONCENTRACIÓN DE TOP WINNERS")
+    if all_trades:
+        total_pnl_all = sum(t["pnl_usdt"] for t in all_trades)
+        sorted_by_pnl = sorted(all_trades, key=lambda t: t["pnl_usdt"], reverse=True)
+        for n in (1, 5, 10, 20):
+            n_eff = min(n, len(all_trades))
+            top_n = sorted_by_pnl[:n_eff]
+            rest  = sorted_by_pnl[n_eff:]
+            top_pnl = sum(t["pnl_usdt"] for t in top_n)
+            pct = (top_pnl / total_pnl_all * 100) if total_pnl_all != 0 else 0.0
+            rest_s = _compute_stats(rest)
+            print(
+                f"  Top {n_eff:<3} trades → {_usd(top_pnl):>10}  ({pct:>+6.1f}% of total PnL) | "
+                f"Rest: WR {rest_s['winrate']:>5.1f}%  PF {rest_s['profit_factor']:>4.2f}  "
+                f"Exp {rest_s['expectancy']:>+.3f}"
+            )
+        print()
+        print("  Interpretación: si los top-5 concentran >70% del PnL,")
+        print("  la ventaja estadística puede ser frágil (dependencia de outliers).")
+
+    # ── Section 13: Files generated ───────────────────────────────────────────
+    _section("13. ARCHIVOS GENERADOS")
     print(f"  Trades CSV   : {csv_path}")
     print(f"  Analysis CSV : {analysis_path}")
     print(f"  Equity CSV   : {equity_path}")
