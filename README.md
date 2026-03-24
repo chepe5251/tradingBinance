@@ -164,7 +164,19 @@ python -m pytest tests/ --cov=risk --cov=strategy --cov=sizing \
   --cov-report=term-missing
 ```
 
-All 31 tests run without a live Binance API key. `pyproject.toml` adds the repo root to `sys.path` automatically.
+All 109 tests run without a live Binance API key. `pyproject.toml` adds the repo root to `sys.path` automatically.
+
+**Coverage baseline (core modules):**
+
+| Module | Coverage |
+|---|---|
+| `monitor_logic.py` | 98% |
+| `indicators.py` | 95% |
+| `sizing.py` | 96% |
+| `risk.py` | 85% |
+| `strategy.py` | 88% |
+| `execution.py` | 49% |
+| **Total** | **67%** |
 
 ## Lint
 

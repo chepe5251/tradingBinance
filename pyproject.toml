@@ -7,6 +7,12 @@ markers = [
     "integration: tests that wire multiple real components together",
 ]
 addopts = "--tb=short"
+filterwarnings = [
+    # python-binance 1.0.34 imports websockets.legacy / WebSocketClientProtocol
+    # which are deprecated in websockets 14+. Suppress these known third-party warnings.
+    "ignore::DeprecationWarning:websockets",
+    "ignore::DeprecationWarning:binance",
+]
 
 [tool.coverage.run]
 source = ["."]
