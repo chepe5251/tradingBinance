@@ -189,8 +189,7 @@ def from_env() -> Settings:
         settings.extra_symbols = _parse_list(extra_symbols_raw)
 
     _set_bool(settings, "use_top_volume_symbols", "USE_TOP_VOLUME_SYMBOLS")
-    _set_int(settings, "top_volume_symbols_count", "TOP_VOLUME_SYMBOLS_COUNT", minimum=0)
-    _set_int(settings, "top_symbols_limit", "TOP_SYMBOLS_LIMIT", minimum=0)
+    # top_volume_symbols_count and top_symbols_limit are fixed in code (Settings defaults)
     _set_float(settings, "top_volume_min_price", "TOP_VOLUME_MIN_PRICE", minimum=0.0)
     _set_float(
         settings,
