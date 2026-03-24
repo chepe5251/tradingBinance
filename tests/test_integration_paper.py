@@ -34,12 +34,13 @@ class TestIntegrationPaper(unittest.TestCase):
         settings.max_positions = 1
         settings.use_limit_only = True
         settings.cooldown_sec = 0
+        # Keep synthetic dataset compatible with liquidation-distance guard.
+        settings.leverage = 100
 
-        # Keep runtime logic unchanged; use risk_based only inside this test setup.
-        settings.sizing_mode = "risk_based"
-        settings.risk_per_trade_pct = 0.10
+        # Validate pct-balance sizing path used in current runtime.
+        settings.sizing_mode = "pct_balance"
+        settings.risk_per_trade_pct = 0.05
         settings.margin_utilization = 0.95
-        settings.fixed_margin_per_trade_usdt = 0.0  # disables liquidation-zone guard branch
 
         # Make controlled dataframe pass strategy gates.
         settings.min_score = 0.0
@@ -151,4 +152,5 @@ class TestIntegrationPaper(unittest.TestCase):
 
         margin_match = re.search(r"margin=([0-9.]+)", entry_messages[0])
         assert margin_match is not None
-        assert float(margin_match.group(1)) > 0.0
+        used_margin = float(margin_match.group(1))
+        assert used_margin == pytest.approx(5.0, abs=0.5)
