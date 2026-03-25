@@ -351,13 +351,13 @@ def from_env() -> Settings:
     _set_float(settings, "limit_offset_pct", "LIMIT_OFFSET_PCT", minimum=0.0)
     _set_int(settings, "limit_timeout_sec", "LIMIT_TIMEOUT_SEC", minimum=1)
     _set_int(settings, "cooldown_sec", "COOLDOWN_SEC", minimum=0)
-    _set_int(settings, "max_consecutive_losses", "MAX_CONSECUTIVE_LOSSES", minimum=1)
+    _set_int(settings, "max_consecutive_losses", "MAX_CONSECUTIVE_LOSSES", minimum=0)
     _set_float(settings, "daily_drawdown_limit", "DAILY_DRAWDOWN_LIMIT", minimum=0.0, maximum=1.0)
     _set_float(
         settings,
         "daily_drawdown_limit_usdt",
         "DAILY_DRAWDOWN_LIMIT_USDT",
-        minimum=1.0,
+        minimum=0.0,
     )
     _set_int(
         settings,

@@ -557,8 +557,8 @@ class EntryService:
             if self.settings.sizing_mode == SIZING_MODE_FIXED_MARGIN
             else float(plan.margin_to_use)
         )
-        if margin_initial_ref > 0 and plan.qty_l1 > 0:
-            min_sl_distance_for_rebuy = (margin_initial_ref * 1.5) / plan.qty_l1
+        if self.settings.anti_liq_trigger_r > 0 and margin_initial_ref > 0 and plan.qty_l1 > 0:
+            min_sl_distance_for_rebuy = (margin_initial_ref * self.settings.anti_liq_trigger_r) / plan.qty_l1
             if plan.side == "BUY":
                 sl_required = plan.entry_price - min_sl_distance_for_rebuy
                 if plan.sl_common > sl_required:
@@ -596,7 +596,7 @@ class EntryService:
                 if self.settings.sizing_mode == SIZING_MODE_FIXED_MARGIN
                 else float(plan.margin_to_use)
             )
-            min_sl_distance_for_rebuy = (margin_initial_ref * 1.5) / plan.qty_l1 if plan.qty_l1 > 0 else 0.0
+            min_sl_distance_for_rebuy = (margin_initial_ref * self.settings.anti_liq_trigger_r) / plan.qty_l1 if plan.qty_l1 > 0 else 0.0
             if plan.side == "BUY":
                 sl_required = plan.entry_price - min_sl_distance_for_rebuy
             else:

@@ -88,24 +88,26 @@ class RiskManager:
                 if elapsed < self.cooldown_sec:
                     return False
 
-            if self.state.consecutive_losses >= self.max_consecutive_losses:
+            if self.max_consecutive_losses > 0 and self.state.consecutive_losses >= self.max_consecutive_losses:
                 self.state.loss_pause_until = now + timedelta(seconds=max(0, self.loss_pause_sec))
                 self.state.consecutive_losses = 0
                 return False
 
-            drawdown = 0.0
-            if self.state.day_start_equity > 0:
-                drawdown = (
-                    self.state.day_start_equity - self.state.equity
-                ) / self.state.day_start_equity
-            if drawdown >= self.daily_drawdown_limit:
-                self.state.paused = True
-                return False
+            if self.daily_drawdown_limit > 0:
+                drawdown = 0.0
+                if self.state.day_start_equity > 0:
+                    drawdown = (
+                        self.state.day_start_equity - self.state.equity
+                    ) / self.state.day_start_equity
+                if drawdown >= self.daily_drawdown_limit:
+                    self.state.paused = True
+                    return False
 
-            dd_usdt = self.state.day_start_equity - self.state.equity
-            if dd_usdt >= self.daily_drawdown_limit_usdt:
-                self.state.paused = True
-                return False
+            if self.daily_drawdown_limit_usdt > 0:
+                dd_usdt = self.state.day_start_equity - self.state.equity
+                if dd_usdt >= self.daily_drawdown_limit_usdt:
+                    self.state.paused = True
+                    return False
             return True
 
     def update_trade(self, pnl: float, now: datetime) -> None:
