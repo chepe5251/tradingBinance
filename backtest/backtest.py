@@ -39,6 +39,7 @@ from __future__ import annotations
 import csv
 import multiprocessing
 import os
+import re
 import statistics
 import sys
 import threading
@@ -148,7 +149,16 @@ _rate_limiter = RateLimiter()
 
 def _load_symbols(client: Client) -> list[str]:
     """Return top TOP_SYMBOLS USDT-M perpetual symbols by 24h quote volume."""
-    configured_symbols = list(dict.fromkeys(APP_SETTINGS.symbols + APP_SETTINGS.extra_symbols))
+    symbol_pattern = re.compile(r"^[A-Z0-9]{2,20}USDT$")
+    configured_symbols = [
+        symbol
+        for symbol in dict.fromkeys(
+            s.strip().upper()
+            for s in (APP_SETTINGS.symbols + APP_SETTINGS.extra_symbols)
+            if isinstance(s, str) and s.strip()
+        )
+        if symbol_pattern.match(symbol)
+    ]
     if configured_symbols and not APP_SETTINGS.use_top_volume_symbols:
         if TOP_SYMBOLS > 0:
             return configured_symbols[:TOP_SYMBOLS]
@@ -166,7 +176,7 @@ def _load_symbols(client: Client) -> list[str]:
             s.get("status") == "TRADING"
             and s.get("contractType") == "PERPETUAL"
             and s.get("quoteAsset") == "USDT"
-            and str(s.get("symbol", "")).endswith("USDT")
+            and symbol_pattern.match(str(s.get("symbol", "")).upper())
         ):
             perp.add(s["symbol"])
 
@@ -199,8 +209,12 @@ def _load_symbols(client: Client) -> list[str]:
         ] or ranked
 
     top_symbols = ranked[:TOP_SYMBOLS] if TOP_SYMBOLS > 0 else ranked
-    for symbol in APP_SETTINGS.top_volume_allowlist:
-        if symbol in perp and symbol not in top_symbols:
+    for symbol in (
+        s.strip().upper()
+        for s in APP_SETTINGS.top_volume_allowlist
+        if isinstance(s, str) and s.strip()
+    ):
+        if symbol_pattern.match(symbol) and symbol in perp and symbol not in top_symbols:
             top_symbols.append(symbol)
     return top_symbols
 

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable
 
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
+from requests.exceptions import RequestException
 
 from execution import FuturesExecutor
 from monitor import PositionMonitor
@@ -22,14 +23,37 @@ if TYPE_CHECKING:
 
 # Binance may return either variant depending on the endpoint and order version
 PROTECTION_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TAKE_PROFIT", "STOP", "TRAILING_STOP_MARKET"}
+CLIENT_INIT_ERRORS = (
+    BinanceAPIException,
+    BinanceRequestException,
+    RequestException,
+    OSError,
+    ValueError,
+    TypeError,
+)
 
 
 def configure_client(api_key: str, api_secret: str, testnet: bool) -> Client:
-    """Build a Binance client and normalize futures endpoint selection."""
-    client = Client(api_key, api_secret, testnet=testnet)
-    if testnet:
-        client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-    return client
+    """Build a Binance client and normalize futures endpoint selection.
+
+    The python-binance Client performs an eager ping during initialization.
+    Retry a few times to tolerate transient DNS/network failures at startup.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            client = Client(api_key, api_secret, testnet=testnet)
+            if testnet:
+                client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+            return client
+        except CLIENT_INIT_ERRORS as exc:
+            last_error = exc
+            if attempt >= 5:
+                break
+            time.sleep(min(5.0, float(2 ** (attempt - 1))))
+    raise RuntimeError(
+        "Binance client initialization failed after retries"
+    ) from last_error
 
 
 def get_available_balance(client: Client) -> float:

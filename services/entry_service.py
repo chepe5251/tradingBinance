@@ -776,7 +776,8 @@ class EntryService:
         strategy_risk = float(plan.signal.get("risk_per_unit") or 0.0)
         tp_risk_cap = strategy_risk if strategy_risk > 0 else risk_distance
         tp_risk_basis = min(risk_distance, tp_risk_cap)
-        tp_rr_effective = max(float(self.settings.tp_rr), 1.8)
+        # Keep execution RR aligned with the original signal/trade plan RR.
+        tp_rr_effective = max(float(plan.signal_rr), 1.8)
         tp = (
             entry_price + (tp_rr_effective * tp_risk_basis)
             if plan.side == "BUY"

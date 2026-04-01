@@ -230,6 +230,33 @@ def ensure_orphan_protections(
         time.sleep(2)
         if attempts >= 15:
             trades_logger.info("critical %s reason=orphan_tp_sl_fail", symbol)
+            emergency_qty = float(orphan_trade_state.get("qty") or 0.0)
+            try:
+                if emergency_qty > 0:
+                    executor.close_position_market(side, emergency_qty)
+                    trades_logger.info(
+                        "orphan %s emergency_close_submitted qty=%.6f",
+                        symbol,
+                        emergency_qty,
+                    )
+                ops_call(
+                    "record_orphan_status",
+                    symbol=symbol,
+                    status="forced_close_submitted",
+                    detail="orphan_tp_sl_fail",
+                    trace_id=trace_id,
+                )
+            except MONITOR_ERRORS as close_exc:
+                logger.error("Orphan emergency close failed %s: %s", symbol, close_exc)
+                ops_call(
+                    "record_error",
+                    stage="orphan_emergency_close",
+                    err=close_exc,
+                    symbol=symbol,
+                    recoverable=False,
+                    api_related=True,
+                    trace_id=trace_id,
+                )
             ops_call(
                 "record_orphan_status",
                 symbol=symbol,
@@ -240,4 +267,3 @@ def ensure_orphan_protections(
             return None
 
     return tp_ref, sl_ref
-

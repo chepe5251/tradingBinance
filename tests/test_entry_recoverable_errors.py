@@ -9,6 +9,7 @@ import pytest
 
 from config import Settings
 from risk import RiskManager
+from services.domain_models import EntryFillResult
 from services.entry_service import EntryService
 from services.position_service import PositionCache
 from services.signal_service import SignalCandidate
@@ -97,3 +98,27 @@ class EntryRecoverableErrorsTests(unittest.TestCase):
         plan = service._build_trade_plan(candidate, "15m", trace_id="t2")  # noqa: SLF001
         self.assertIsNone(plan)
 
+    def test_finalize_entry_uses_signal_rr_for_tp(self) -> None:
+        service = self._service()
+        candidate = SignalCandidate(
+            symbol="BTCUSDT",
+            interval="15m",
+            payload={"side": "BUY", "price": 100.0, "atr": 1.0, "risk_per_unit": 0.5, "rr_target": 2.0},
+        )
+        plan = service._build_trade_plan(candidate, "15m", trace_id="t3")  # noqa: SLF001
+        self.assertIsNotNone(plan)
+        assert plan is not None
+
+        fill = EntryFillResult(
+            success=True,
+            filled_qty=plan.qty_l1,
+            avg_price=plan.entry_price,
+            exec_type="MAKER",
+        )
+        context = service._finalize_entry(plan, fill)  # noqa: SLF001
+        self.assertIsNotNone(context)
+        assert context is not None
+
+        expected_basis = min(context.trade_state.risk_distance, plan.signal_risk)
+        expected_tp = context.trade_state.entry_price + (expected_basis * plan.signal_rr)
+        self.assertAlmostEqual(context.trade_state.tp, expected_tp, places=8)
