@@ -335,11 +335,14 @@ class FuturesExecutor:
                 quantity=self._round_qty(remaining),
             )
             m_avg = self._first_positive_float(m.get("avgPrice"), m.get("price"), avg_price, price, default=price)
+            m_executed_qty = float(m.get("executedQty") or self._round_qty(remaining) or 0.0)
             if executed_qty > 0:
-                avg_price = ((executed_qty * avg_price) + (remaining * m_avg)) / (executed_qty + remaining)
+                total_qty = executed_qty + m_executed_qty
+                if total_qty > 0:
+                    avg_price = ((executed_qty * avg_price) + (m_executed_qty * m_avg)) / total_qty
             else:
                 avg_price = m_avg
-            executed_qty = executed_qty + remaining
+            executed_qty = executed_qty + m_executed_qty
         if avg_price <= 0:
             avg_price = self._first_positive_float(price, default=price)
         return executed_qty, avg_price, exec_type
@@ -714,11 +717,15 @@ class FuturesExecutor:
         while True:
             # ── Max hold timeout ─────────────────────────────────────────────
             if max_hold_sec > 0 and time.time() - start_ts >= max_hold_sec:
+                close_ok = True
                 if side and current_qty:
                     try:
                         self.close_position_market(side, current_qty)
                     except EXCHANGE_ERRORS:
-                        pass
+                        close_ok = False
+                if not close_ok:
+                    time.sleep(0.5)
+                    continue
                 exit_p = 0.0
                 try:
                     exit_p = float(price_fn()) if price_fn else float(current_entry or 0.0)
@@ -739,10 +746,14 @@ class FuturesExecutor:
                     updates = None
                 if isinstance(updates, dict):
                     if updates.get("close_all"):
+                        close_ok = True
                         try:
                             self.close_position_market(side, float(current_qty))
                         except EXCHANGE_ERRORS:
-                            pass
+                            close_ok = False
+                        if not close_ok:
+                            time.sleep(0.5)
+                            continue
                         return f"EARLY:{updates.get('reason', 'scale_cancel')}", float(updates.get("exit_price") or current_entry)
                     current_entry = float(updates["entry_price"]) if updates.get("entry_price") else current_entry
                     current_qty = float(updates["qty"]) if updates.get("qty") else current_qty
@@ -783,10 +794,14 @@ class FuturesExecutor:
                     except Exception:  # review_fn is caller-provided; skip exit on error
                         should_exit, reason = False, ""
                     if should_exit:
+                        close_ok = True
                         try:
                             self.close_position_market(side, current_qty)
                         except EXCHANGE_ERRORS:
-                            pass
+                            close_ok = False
+                        if not close_ok:
+                            time.sleep(0.5)
+                            continue
                         return f"EARLY:{reason}" if reason else "EARLY", float(price_fn() or current_entry)
 
             # ── Breakeven and trailing management ────────────────────────────

@@ -58,18 +58,20 @@ from strategy import StrategyConfig, evaluate_signal  # noqa: E402
 
 # ── configuration ─────────────────────────────────────────────────────────────
 APP_SETTINGS = from_env()
-TOP_SYMBOLS = APP_SETTINGS.top_volume_symbols_count  # fixed at 300 in config.py
+TOP_SYMBOLS = 300
 MAIN_INTERVAL = APP_SETTINGS.main_interval
 CONTEXT_INTERVAL = APP_SETTINGS.context_interval
 HIGHER_INTERVAL = {"15m": "1h", "1h": "4h"}.get(CONTEXT_INTERVAL, "4h")
+DAILY_INTERVAL  = "1d"
 INTERVALS: list[str] = []
-for _interval in [MAIN_INTERVAL, CONTEXT_INTERVAL, HIGHER_INTERVAL]:
+for _interval in [MAIN_INTERVAL, CONTEXT_INTERVAL, HIGHER_INTERVAL, DAILY_INTERVAL]:
     if _interval and _interval not in INTERVALS:
         INTERVALS.append(_interval)
 
 CANDLES_PER_INTERVAL: dict[str, int] = {
-    MAIN_INTERVAL: max(1500, APP_SETTINGS.history_candles_main),
+    MAIN_INTERVAL:    max(1500, APP_SETTINGS.history_candles_main),
     CONTEXT_INTERVAL: max(720, APP_SETTINGS.history_candles_context),
+    DAILY_INTERVAL:   500,   # ~2 years of daily data
 }
 if HIGHER_INTERVAL not in CANDLES_PER_INTERVAL:
     CANDLES_PER_INTERVAL[HIGHER_INTERVAL] = max(500, APP_SETTINGS.history_candles_context)
@@ -280,10 +282,10 @@ def _simulate_trades(
     symbol: str,
     interval: str,
     context_df: pd.DataFrame | None = None,
-) -> tuple[list[dict], int, int]:
+) -> tuple[list[dict], int, int, dict[str, int], dict[str, int]]:
     """Walk through df candle-by-candle and simulate every signal.
 
-    Returns (trades, skipped_4h_sell, skipped_low_score).
+    Returns (trades, skipped_4h_sell, skipped_low_score, rejects, diagnostics).
     """
     # Precompute indicators once for extra CSV fields
     ema20   = _ema_col(df["close"], APP_SETTINGS.ema_fast)
@@ -294,6 +296,8 @@ def _simulate_trades(
     rsi     = _rsi_col(df["close"], APP_SETTINGS.rsi_period)
 
     trades: list[dict] = []
+    rejects: dict[str, int] = {}
+    diagnostics = {"eval_calls": 0, "signals": 0, "eval_exceptions": 0}
     skipped_4h_sell = 0
     skipped_low_score = 0
     i = min(230, max(20, len(df) // 2))  # warm-up: use half the data or 230, min 20
@@ -310,15 +314,24 @@ def _simulate_trades(
             context_sub = context_df.loc[context_df["close_time"] <= cutoff]
         else:
             context_sub = pd.DataFrame()
+        diagnostics["eval_calls"] += 1
         try:
-            signal = evaluate_signal(sub, context_sub, _STRATEGY_CFG)
+            signal = evaluate_signal(
+                sub,
+                context_sub,
+                _STRATEGY_CFG,
+                interval=interval,
+                rejects=rejects,
+            )
         except Exception:
+            diagnostics["eval_exceptions"] += 1
             i += 1
             continue
 
         if signal is None:
             i += 1
             continue
+        diagnostics["signals"] += 1
 
         # Mirror production filters exactly
         if interval == HIGHER_INTERVAL and signal.get("side") == "SELL":
@@ -462,7 +475,7 @@ def _simulate_trades(
 
         i += SKIP_AFTER_SIGNAL
 
-    return trades, skipped_4h_sell, skipped_low_score
+    return trades, skipped_4h_sell, skipped_low_score, rejects, diagnostics
 
 
 # ── stats helpers ─────────────────────────────────────────────────────────────
@@ -632,9 +645,14 @@ def _save_csv(all_trades: list[dict], ts: str) -> str:
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
     os.makedirs(results_dir, exist_ok=True)
     path = os.path.join(results_dir, f"backtest_{ts}.csv")
-    if not all_trades:
-        return path
-    fieldnames = list(all_trades[0].keys())
+    default_fieldnames = [
+        "symbol", "interval", "side", "entry_time", "exit_time",
+        "entry_price", "exit_price", "stop_price", "tp_price",
+        "pnl_usdt", "result", "candles_held", "score", "signal_candle",
+        "ema_spread", "rsi_at_signal", "vol_ratio", "body_ratio",
+        "distance_to_tp", "distance_to_sl", "rr_planned", "market_phase",
+    ]
+    fieldnames = list(all_trades[0].keys()) if all_trades else default_fieldnames
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -926,7 +944,7 @@ def _print_report(
                 iv_counts = sorted(days_by_interval[iv].values())
                 if iv_counts:
                     avg_iv = sum(iv_counts) / len(iv_counts)
-                    print(f"  {iv} → {avg_iv:.1f} trades/día promedio ({len(iv_counts)} días activos)")
+                    print(f"  {iv} -> {avg_iv:.1f} trades/día promedio ({len(iv_counts)} días activos)")
 
     # ── Section 12: Top-winner concentration ─────────────────────────────────
     _section("12. CONCENTRACIÓN DE TOP WINNERS")
@@ -941,7 +959,7 @@ def _print_report(
             pct = (top_pnl / total_pnl_all * 100) if total_pnl_all != 0 else 0.0
             rest_s = _compute_stats(rest)
             print(
-                f"  Top {n_eff:<3} trades → {_usd(top_pnl):>10}  ({pct:>+6.1f}% of total PnL) | "
+                f"  Top {n_eff:<3} trades -> {_usd(top_pnl):>10}  ({pct:>+6.1f}% of total PnL) | "
                 f"Rest: WR {rest_s['winrate']:>5.1f}%  PF {rest_s['profit_factor']:>4.2f}  "
                 f"Exp {rest_s['expectancy']:>+.3f}"
             )
@@ -985,7 +1003,7 @@ def _download_one(args: tuple) -> tuple[str, str, pd.DataFrame | None, str | Non
 
 # ── simulation task (top-level for pickle / ProcessPoolExecutor) ──────────────
 
-def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int]:
+def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int, dict[str, int], dict[str, int]]:
     """Pickleable wrapper for ProcessPoolExecutor - Phase 2."""
     df_dict, context_dict, sym, interval = args
     df = pd.DataFrame(df_dict)
@@ -998,8 +1016,8 @@ def _simulate_task(args: tuple) -> tuple[str, str, list[dict], int, int]:
         context_df["open_time"] = pd.to_datetime(context_df["open_time"], utc=True)
         context_df["close_time"] = pd.to_datetime(context_df["close_time"], utc=True)
 
-    trades, s4h, ssc = _simulate_trades(df, sym, interval, context_df=context_df)
-    return sym, interval, trades, s4h, ssc
+    trades, s4h, ssc, rejects, diagnostics = _simulate_trades(df, sym, interval, context_df=context_df)
+    return sym, interval, trades, s4h, ssc, rejects, diagnostics
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -1055,6 +1073,11 @@ def main() -> None:
     all_trades: list[dict] = []
     total_skipped_4h_sell   = 0
     total_skipped_low_score = 0
+    reject_totals: dict[str, int] = {}
+    reject_by_interval: dict[str, dict[str, int]] = {iv: {} for iv in INTERVALS}
+    eval_calls_total = 0
+    eval_signals_total = 0
+    eval_exceptions_total = 0
     total_sim = len(kline_data)
     sim_done  = 0
 
@@ -1067,6 +1090,8 @@ def main() -> None:
     context_by_interval: dict[str, str] = {MAIN_INTERVAL: CONTEXT_INTERVAL}
     if CONTEXT_INTERVAL != HIGHER_INTERVAL:
         context_by_interval[CONTEXT_INTERVAL] = HIGHER_INTERVAL
+    # 1D uses 4H (HIGHER_INTERVAL) as its higher-timeframe context.
+    context_by_interval[DAILY_INTERVAL] = HIGHER_INTERVAL
 
     sim_args = []
     for (sym, interval), df in kline_data.items():
@@ -1094,10 +1119,17 @@ def main() -> None:
         for future in as_completed(futures):
             sim_done += 1
             try:
-                sym, interval, trades, s4h, ssc = future.result()
+                sym, interval, trades, s4h, ssc, rejects, diagnostics = future.result()
                 all_trades.extend(trades)
                 total_skipped_4h_sell   += s4h
                 total_skipped_low_score += ssc
+                eval_calls_total += int(diagnostics.get("eval_calls", 0))
+                eval_signals_total += int(diagnostics.get("signals", 0))
+                eval_exceptions_total += int(diagnostics.get("eval_exceptions", 0))
+                for key, value in rejects.items():
+                    reject_totals[key] = reject_totals.get(key, 0) + int(value)
+                    iv_rejects = reject_by_interval.setdefault(interval, {})
+                    iv_rejects[key] = iv_rejects.get(key, 0) + int(value)
             except Exception as exc:
                 sym, interval = futures[future]
                 print(f"  [SIM ERROR] {sym} {interval}: {exc}")
@@ -1117,7 +1149,49 @@ def main() -> None:
     print(f"  Descarga:   {_dl_end - t0:.0f}s")
     print(f"  Simulación: {time.time() - t1:.0f}s")
     print(f"  TOTAL:      {_total:.0f}s ({_total / 60:.1f} min)")
+    print(f"  evaluate_signal llamadas: {eval_calls_total}")
+    print(f"  SeÃ±ales emitidas (pre-trade): {eval_signals_total}")
+    print(f"  Excepciones en evaluate_signal: {eval_exceptions_total}")
     print(f"  Trades generados: {len(all_trades)}")
+
+    reject_keys = [
+        "reject_trend",
+        "reject_spread_min",
+        "reject_spread_max",
+        "reject_pullback",
+        "reject_structure",
+        "reject_rsi",
+        "reject_body",
+        "reject_volume",
+        "reject_confirmation",
+        "reject_extension",
+        "reject_htf",
+        "reject_risk",
+        "reject_score",
+        "reject_atr_spike",
+    ]
+    print(f"\n{'=' * 60}")
+    print("  DIAGNOSTICO DE FILTROS (reject_*)")
+    print(f"{'=' * 60}")
+    total_rejects = sum(reject_totals.values())
+    print(f"  Total rechazos contabilizados: {total_rejects}")
+    for key in reject_keys:
+        print(f"  {key:<24}: {reject_totals.get(key, 0)}")
+
+    print(f"\n{'=' * 60}")
+    print("  RECHAZOS POR INTERVALO")
+    print(f"{'=' * 60}")
+    for iv in INTERVALS:
+        iv_counts = reject_by_interval.get(iv, {})
+        iv_total = sum(iv_counts.values())
+        print(f"  {iv}: {iv_total}")
+        for key in reject_keys:
+            value = iv_counts.get(key, 0)
+            if value > 0:
+                print(f"    {key}: {value}")
+
+    if not all_trades:
+        print("\n[WARN] No se generaron trades; revisar el diagnÃ³stico de filtros arriba.")
 
     # Sort chronologically before saving — ensures equity curve is meaningful
     all_trades.sort(key=lambda t: t.get("entry_time", ""))

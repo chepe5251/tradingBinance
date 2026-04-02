@@ -71,7 +71,7 @@ def evaluate_interval_signals(
         context_df = (
             stream.get_dataframe(symbol, context_interval) if context_interval else pd.DataFrame()
         )
-        signal = evaluate_signal(symbol_df, context_df, cfg)
+        signal = evaluate_signal(symbol_df, context_df, cfg, interval=interval)
         if not signal:
             continue
 

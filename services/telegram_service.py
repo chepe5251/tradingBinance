@@ -23,28 +23,24 @@ def format_signal_message(
     structure: str,
 ) -> str:
     """Render a standard signal alert."""
-    is_long = side == "BUY"
-    direction = "LONG" if is_long else "SHORT"
-    htf_txt = "Bullish" if htf_bias == "LONG" else "Bearish"
+    htf_txt = "Alcista ✅" if htf_bias == "LONG" else "Bajista ⚠️"
+    risk_pct = abs(entry - sl) / entry * 100 if entry > 0 else 0.0
+    reward_pct = abs(tp - entry) / entry * 100 if entry > 0 else 0.0
     return (
-        f"SIGNAL CONFIRMED\n"
-        f"{direction} | {symbol} | {timeframe}\n"
-        "------------------\n"
-        f"HTF bias: {htf_txt}\n"
-        f"Structure: {structure}\n"
-        f"Quality: {quality}\n"
-        f"Volatility: {volatility}\n"
-        "\n"
-        f"Entry: {entry:.6f}\n"
-        f"Stop Loss: {sl:.6f}\n"
-        f"Take Profit: {tp:.6f}\n"
-        f"R:R: 1:{rr:.2f}"
+        f"🚀 SEÑAL CONFIRMADA — LONG\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 Par:        {symbol}\n"
+        f"⏱  Timeframe:  {timeframe}\n"
+        f"📊 HTF bias:   {htf_txt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Entrada:    {entry:.6f}\n"
+        f"🛑 Stop Loss:  {sl:.6f}  (-{risk_pct:.2f}%)\n"
+        f"💰 Take Profit:{tp:.6f}  (+{reward_pct:.2f}%)\n"
+        f"⚖️  R:R:        1:{rr:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📐 Estructura: {structure}"
     )
 
-
-def format_trade_event_message(symbol: str, title: str, detail: str) -> str:
-    """Build compact messages for entry/exit/rebuy events."""
-    return f"{title}\n{symbol}\n{detail}"
 
 
 class TelegramService:

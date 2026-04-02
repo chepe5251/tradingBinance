@@ -646,20 +646,7 @@ class OperationalService:
         self._recent_events.append({"ts_utc": _utc_now_iso(), "kind": kind, "detail": detail})
 
     def _send_alert_locked(self, *, key: str, title: str, detail: str) -> None:
-        if not bool(getattr(self.settings, "enable_operational_alerts", False)):
-            return
-        if self._telegram is None or not self._telegram.enabled:
-            return
-
-        now = time.time()
-        cooldown = max(10, int(getattr(self.settings, "operational_alert_cooldown_sec", 300)))
-        last = self._last_alert_ts.get(key, 0.0)
-        if now - last < cooldown:
-            return
-        self._last_alert_ts[key] = now
-
-        msg = f"{title}\nmode={self._runtime_mode}\n{detail}"
-        threading.Thread(target=self._telegram.send, args=(msg,), daemon=True).start()
+        pass  # Telegram is reserved for trade signals only (entry_service)
 
     def _maybe_emit_periodic_summaries_locked(self, now: float) -> None:
         if bool(getattr(self.settings, "ops_hourly_summary", True)):
