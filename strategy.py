@@ -199,13 +199,16 @@ def evaluate_signal(
     elif _strict and interval in {"4h", "1d"}:
         trend_ok = s_ema_fast > s_ema_mid and s_ema_mid > s_ema_trend
     if not trend_ok:
-        _r("reject_trend"); return None
+        _r("reject_trend")
+        return None
 
     spread_atr = (s_ema_fast - s_ema_mid) / s_atr
     if spread_atr < cfg.min_ema_spread_atr:
-        _r("reject_spread_min"); return None
+        _r("reject_spread_min")
+        return None
     if spread_atr > spread_max_iv:
-        _r("reject_spread_max"); return None
+        _r("reject_spread_max")
+        return None
 
     # 2) Pullback near fast EMA (per-interval tolerance).
     # 1D also accepts pullback into the EMA20–EMA50 zone (wider swing rhythm).
@@ -214,64 +217,79 @@ def evaluate_signal(
         in_ema20_zone = s_low <= s_ema_fast + tolerance and s_low >= s_ema_fast - tolerance
         in_ema50_zone = s_low <= s_ema_fast and s_low >= s_ema_mid - (0.20 * s_atr)
         if not (in_ema20_zone or in_ema50_zone):
-            _r("reject_pullback"); return None
+            _r("reject_pullback")
+            return None
     else:
         if not (s_low <= s_ema_fast + tolerance and s_low >= s_ema_fast - tolerance):
-            _r("reject_pullback"); return None
+            _r("reject_pullback")
+            return None
 
     # 3) Structure intact after pullback.
     if s_close <= s_ema_mid:
-        _r("reject_structure"); return None
+        _r("reject_structure")
+        return None
     if p_ema_fast <= 0:
         return None
 
     # 4) Momentum and participation (per-interval RSI / body bounds).
     if not (rsi_min <= s_rsi <= rsi_max):
-        _r("reject_rsi"); return None
+        _r("reject_rsi")
+        return None
     upper_third = s_low + (2 / 3) * candle_range
     if not (body_ratio >= body_min and s_close > s_open and s_close > upper_third):
-        _r("reject_body"); return None
+        _r("reject_body")
+        return None
     volume_ratio = s_vol / s_avg_vol
     if volume_ratio < cfg.volume_min_ratio:
-        _r("reject_volume"); return None
+        _r("reject_volume")
+        return None
     if _strict and interval in {"15m", "1h"}:
         # Soft extreme-volume rejection for chased candles.
         rsi_mid = rsi_min + 0.5 * (rsi_max - rsi_min)
         if volume_ratio > 2.5 and s_rsi >= rsi_mid:
-            _r("reject_volume_extreme"); return None
+            _r("reject_volume_extreme")
+            return None
 
     # ── Anti-extension / anti-momentum filters (production only) ─────────────
     if _strict:
         if interval == "15m":
             # Reject when signal is already too far above EMA20.
             if (s_high - s_ema_fast) > 1.60 * s_atr:
-                _r("reject_extension"); return None
+                _r("reject_extension")
+                return None
             if s_rsi > 57.0:
-                _r("reject_extension"); return None
+                _r("reject_extension")
+                return None
         elif interval == "1h":
             # Reject overextended RSI or over-spread EMA.
             if s_rsi > 58.0:
-                _r("reject_extension"); return None
+                _r("reject_extension")
+                return None
             if (s_ema_fast - s_ema_mid) > 1.80 * s_atr:
-                _r("reject_extension"); return None
+                _r("reject_extension")
+                return None
         elif interval == "4h":
             # Reject overextended RSI.
             if s_rsi > 68.0:
-                _r("reject_extension"); return None
+                _r("reject_extension")
+                return None
         elif interval == "1d":
             # Reject overextended RSI.
             if s_rsi > 66.0:
-                _r("reject_extension"); return None
+                _r("reject_extension")
+                return None
             # Reject when EMA20–EMA50 spread is too extended.
             if (s_ema_fast - s_ema_mid) > 1.10 * s_atr:
-                _r("reject_extension"); return None
+                _r("reject_extension")
+                return None
 
         # Added soft late-entry filter.
         rsi_band = max(1e-9, rsi_max - rsi_min)
         rsi_in_top_decile = s_rsi >= (rsi_max - 0.10 * rsi_band)
         far_from_ema20 = s_close > s_ema_fast and (s_close - s_ema_fast) > 1.2 * s_atr
         if rsi_in_top_decile and far_from_ema20:
-            _r("reject_extension"); return None
+            _r("reject_extension")
+            return None
 
     # 5) Confirmation candle (per-interval, production only).
     conf_range   = c_high - c_low
@@ -288,7 +306,8 @@ def evaluate_signal(
             and c_close <= s_high + 0.35 * s_atr         # no late extension
             and c_low <= s_ema_fast + 0.40 * s_atr       # still near EMA20
         ):
-            _r("reject_confirmation"); return None
+            _r("reject_confirmation")
+            return None
     elif _strict and interval == "1h":
         conf_body_ratio = conf_body / conf_range if conf_range > 0 else 0.0
         recent_slice = df.iloc[-12:-2] if len(df) >= 12 else df.iloc[:-2]
@@ -301,10 +320,12 @@ def evaluate_signal(
             and c_close <= s_high + 0.30 * s_atr         # no late extension
             and c_low <= s_ema_fast + 0.35 * s_atr       # still near EMA20
         ):
-            _r("reject_confirmation"); return None
+            _r("reject_confirmation")
+            return None
         # Reject explosive confirmation candle.
         if avg_body_10 > 0 and conf_body > 2.20 * avg_body_10:
-            _r("reject_confirmation"); return None
+            _r("reject_confirmation")
+            return None
     elif _strict and interval == "4h":
         conf_body_ratio = conf_body / conf_range if conf_range > 0 else 0.0
         if not (
@@ -313,7 +334,8 @@ def evaluate_signal(
             and conf_body_ratio >= 0.25                  # body ≥ 25 % of range
             and c_close <= s_high + 0.35 * s_atr         # no late extension
         ):
-            _r("reject_confirmation"); return None
+            _r("reject_confirmation")
+            return None
     elif _strict and interval == "1d":
         conf_body_ratio = conf_body / conf_range if conf_range > 0 else 0.0
         if not (
@@ -323,7 +345,8 @@ def evaluate_signal(
             and c_close <= s_high + 0.35 * s_atr         # no late extension
             and c_low <= s_ema_fast + 0.35 * s_atr       # still near EMA20
         ):
-            _r("reject_confirmation"); return None
+            _r("reject_confirmation")
+            return None
     else:
         # Non-strict (test context) or unrecognised interval: original check.
         if c_close <= s_high:
@@ -341,14 +364,16 @@ def evaluate_signal(
         elif float(ctx_ema_mid) > float(ctx_ema_trend) and ctx_price > float(ctx_ema_mid):
             htf_bias = "LONG"
         else:
-            _r("reject_htf"); return None
+            _r("reject_htf")
+            return None
     else:
         htf_penalty = cfg.context_missing_penalty
 
     stop_price    = s_low - (stop_buf * s_atr)
     risk_per_unit = entry_price - stop_price
     if risk_per_unit < (cfg.min_risk_atr * s_atr) or risk_per_unit > (cfg.max_risk_atr * s_atr):
-        _r("reject_risk"); return None
+        _r("reject_risk")
+        return None
     tp_price = entry_price + (risk_per_unit * rr)
 
     spread_norm = min(1.0, (spread_atr - cfg.min_ema_spread_atr) * 2)
@@ -397,11 +422,13 @@ def evaluate_signal(
             2,
         )
     if score < min_score_iv:
-        _r("reject_score"); return None
+        _r("reject_score")
+        return None
 
     atr_avg_ratio = s_atr / s_avg_atr if s_avg_atr > 0 else 1.0
     if atr_avg_ratio > cfg.max_atr_avg_ratio:
-        _r("reject_atr_spike"); return None
+        _r("reject_atr_spike")
+        return None
 
     ts = conf.get("close_time")
     breakout_time = (
