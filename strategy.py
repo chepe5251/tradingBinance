@@ -587,15 +587,14 @@ def evaluate_signal(
 
     if _strict:
         # Quality pruning phase.
-        # Aggressive relaxation phase to recover signal flow.
         if interval == "15m":
-            # 15m is the primary frequency engine.
-            rsi_min, rsi_max = 46.0, 60.5
+            # Restored selective 15m baseline.
+            rsi_min, rsi_max = 48.0, 57.0
             body_min         = 0.42
             pullback_tol     = 2.05
             rr               = 1.5
             stop_buf         = 0.40
-            min_score_iv     = 1.20
+            min_score_iv     = 1.30
             spread_max_iv    = 2.60
             volume_min_iv    = 0.95
         elif interval == "1h":
@@ -705,14 +704,14 @@ def evaluate_signal(
     # Anti-extension / anti-momentum filters (production only).
     if _strict:
         if interval == "15m":
-            # Keep only severe extension as hard reject; penalize moderate extension.
+            # Keep severe extension as hard reject; penalize warming momentum earlier.
             if (s_high - s_ema_fast) > 2.20 * s_atr:
                 _r("reject_extension")
                 return None
-            if s_rsi > 62.0:
+            if s_rsi > 57.0:
                 _r("reject_extension")
                 return None
-            if (s_high - s_ema_fast) > 1.65 * s_atr or s_rsi > 58.5:
+            if (s_high - s_ema_fast) > 1.65 * s_atr or s_rsi > 55.5:
                 score_penalty += 0.14
         elif interval == "1h":
             # 1h simple: basic extension caps.
@@ -758,11 +757,11 @@ def evaluate_signal(
 
     if _strict and interval == "15m":
         conf_body_ratio = conf_body / conf_range if conf_range > 0 else 0.0
-        # Softer confirmation for higher flow on 15m.
+        # Require stronger confirmation to avoid marginal continuation entries.
         if not (
             c_close >= s_close * 0.991                   # close enough to signal close
             and conf_bullish                             # bullish candle
-            and conf_body_ratio >= 0.10                  # smaller body accepted
+            and conf_body_ratio >= 0.20                  # minimum follow-through body
             and c_close <= s_high + 0.60 * s_atr         # allow some continuation
             and c_low <= s_ema_fast + 0.85 * s_atr       # keep it near EMA20 zone
         ):
