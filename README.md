@@ -6,6 +6,22 @@ Trading bot for Binance USDT-M futures with:
 - paper and live modes
 - position monitoring (TP/SL, breakeven, trailing)
 
+## Versioning and Releases
+
+- Latest release in this branch line: `v1.0.3` (derived from latest remote tag `v1.0.2`).
+- Project versioning uses repository tags with SemVer format: `vMAJOR.MINOR.PATCH`.
+- Detailed release notes are maintained in [CHANGELOG.md](CHANGELOG.md).
+
+Recommended release gate before tagging:
+
+```bash
+ruff check .
+python -m pytest tests/ -v -m unit
+python -m pytest tests/ -v -m integration
+python -m pytest tests/ --cov=risk --cov=strategy --cov=sizing --cov=execution --cov=monitor_logic --cov=indicators --cov-report=term-missing -q
+docker build -t binance_bot_ci .
+```
+
 ## Runtime (Live/Paper)
 
 Main runtime modules:
