@@ -1353,8 +1353,11 @@ def main() -> None:
     dl_done = 0
     dl_errors = 0
     t0 = time.time()
+    interrupted_phase1 = False
 
-    with ThreadPoolExecutor(max_workers=MAX_DL_WORKERS) as executor:
+    executor = ThreadPoolExecutor(max_workers=MAX_DL_WORKERS)
+    futures = {}
+    try:
         futures = {executor.submit(_download_one, t): t for t in download_tasks}
         for future in as_completed(futures):
             dl_done += 1
@@ -1370,6 +1373,11 @@ def main() -> None:
                 print(f"  Downloaded: {dl_done}/{total_dl} | "
                       f"{elapsed:.0f}s elapsed | ~{remaining:.0f}s remaining | "
                       f"{dl_errors} errors")
+    except KeyboardInterrupt:
+        interrupted_phase1 = True
+        print("\n[WARN] Interrupted during download phase. Continuing with downloaded datasets...")
+    finally:
+        executor.shutdown(wait=not interrupted_phase1, cancel_futures=interrupted_phase1)
 
     _dl_end = time.time()
     print(f"Phase 1 complete: {len(kline_data)} datasets OK, {dl_errors} errors "
@@ -1385,6 +1393,7 @@ def main() -> None:
     eval_signals_total = 0
     eval_exceptions_total = 0
     sim_done  = 0
+    interrupted_phase2 = False
 
     print(f"\n{'=' * 60}")
     print("  PHASE 2: TRADE SIMULATION")
@@ -1418,7 +1427,9 @@ def main() -> None:
     del kline_data  # free memory
 
     t1 = time.time()
-    with ProcessPoolExecutor(max_workers=SIM_WORKERS) as executor:
+    executor = ProcessPoolExecutor(max_workers=SIM_WORKERS)
+    futures = {}
+    try:
         futures = {
             executor.submit(_simulate_task_by_symbol, args): args[0]
             for args in sim_args
@@ -1448,6 +1459,11 @@ def main() -> None:
                 remaining = (total_sim - sim_done) / rate if rate > 0 else 0
                 print(f"  Simulated: {sim_done}/{total_sim} | "
                       f"{elapsed:.0f}s | ~{remaining:.0f}s remaining")
+    except KeyboardInterrupt:
+        interrupted_phase2 = True
+        print("\n[WARN] Interrupted during simulation phase. Saving partial results...")
+    finally:
+        executor.shutdown(wait=not interrupted_phase2, cancel_futures=interrupted_phase2)
 
     del sim_args  # free memory
 
@@ -1462,6 +1478,8 @@ def main() -> None:
     print(f"  Signals emitted (pre-trade): {eval_signals_total}")
     print(f"  Exceptions in evaluate_signal: {eval_exceptions_total}")
     print(f"  Trades generated: {len(all_trades)}")
+    if interrupted_phase1 or interrupted_phase2:
+        print("  NOTE: partial run (interrupted by user)")
 
     reject_keys = [
         "reject_trend",
